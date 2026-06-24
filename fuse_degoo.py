@@ -255,6 +255,16 @@ class Operations(pyfuse3.Operations):
         if inode_p == pyfuse3.ROOT_INODE:
             inode_p = self._get_id_root_degoo()
 
+        # BUG FIX: cp/mv/cat/stat never call opendir+readdir first, so in
+        # lazy mode the directory children may not yet be in degoo_tree_content.
+        # Trigger a fetch for this parent dir if it has no children yet,
+        # exactly as readdir() already does.
+        if self._mode == 'lazy' and not any(
+            e['ParentID'] == inode_p for e in degoo_tree_content.values()
+        ):
+            _fetch_dir_if_needed(inode_p, self._mode)
+            self._refresh_path()
+
         children = self._get_degoo_childs(inode_p)
         attr = None
 

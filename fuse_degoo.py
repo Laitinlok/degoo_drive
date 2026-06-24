@@ -22,7 +22,7 @@ import threading
 import time
 from argparse import ArgumentParser
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import fsencode, fsdecode
 from urllib.parse import urlparse
 from pathlib import Path
@@ -56,6 +56,37 @@ degoo_tree_content = {}
 # Global cligoo client (initialised in main())
 _client: DegooClient = None  # type: ignore[assignment]
 
+# ---------------------------------------------------------------------------
+# Per-process persistent HTTP session with connection pooling
+# ---------------------------------------------------------------------------
+_http_session: requests.Session = None  # type: ignore[assignment]
+
+
+def _make_http_session(pool_connections: int = 8, pool_maxsize: int = 32) -> requests.Session:
+    """Create a requests.Session with a large urllib3 connection pool.
+
+    A single TCP connection to Degoo's CDN is capped at ~8 MB/s by the
+    server-side per-connection rate limit.  Opening *N* parallel connections
+    to the same host multiplies that ceiling by N.  A shared Session with a
+    large HTTPAdapter pool lets all download threads reuse existing sockets
+    instead of paying the TCP/TLS handshake cost on every request.
+    """
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize,
+        max_retries=urllib3.Retry(
+            total=5,
+            backoff_factor=0.5,
+            status_forcelist={429, 500, 502, 503, 504},
+            allowed_methods={"GET"},
+        ),
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 LOCAL_PATH_DEGOO = '/home/degoo'
 PATH_ROOT_DEGOO = '/'
 DEGOO_HOSTNAME_EU = 'c.degoo.eu'
@@ -65,6 +96,10 @@ is_refresh_enabled = True
 caching_file_list = []
 threadLock = threading.Lock()
 requests_control = []
+
+# How many sub-ranges to split one cache chunk into for parallel downloading.
+# Each sub-range is fetched on its own TCP connection simultaneously.
+_DEFAULT_SUBCHUNK_CONNECTIONS = 8
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +161,9 @@ class Operations(pyfuse3.Operations):
     enable_writeback_cache = True
 
     def __init__(self, source, cache_size, flood_sleep_time, flood_time_to_check, flood_max_requests,
-                 enable_flood_control, change_hostname, mode, plex_split_file, download_threads=8):
+                 enable_flood_control, change_hostname, mode, plex_split_file,
+                 download_threads=8, subchunk_connections=_DEFAULT_SUBCHUNK_CONNECTIONS,
+                 lookahead_chunks=2):
         super().__init__()
         self._inode_path_map = {pyfuse3.ROOT_INODE: source}
         self._source = source
@@ -145,8 +182,16 @@ class Operations(pyfuse3.Operations):
         self._change_hostname = change_hostname
         self._mode = mode
         self._plex_split_file = plex_split_file
-        # Thread pool for parallel chunk downloads (replaces ad-hoc threading.Thread)
-        self._download_executor = ThreadPoolExecutor(max_workers=download_threads)
+        self._subchunk_connections = subchunk_connections
+        # Number of chunks to pre-fetch ahead of the current read position.
+        self._lookahead_chunks = max(1, lookahead_chunks)
+        # Thread pool: chunk-level parallelism (one future per chunk).
+        # sub-chunk parallel downloads run inside _cache_file using a *separate*
+        # inner executor so we don't dead-lock the outer pool.
+        self._download_executor = ThreadPoolExecutor(
+            max_workers=download_threads,
+            thread_name_prefix="degoo-dl",
+        )
 
     def __del__(self):
         try:
@@ -484,7 +529,7 @@ class Operations(pyfuse3.Operations):
                 os.remove(path)
             fd = os.open(path, flags | os.O_CREAT | os.O_TRUNC)
         except OSError as exc:
-            raise FUSEError(exc.errno)
+            raise FUSEError(exc.exc)
         attr = self._getattr(fd=fd)
         self._add_path(attr.st_ino, path)
         self._inode_fd_map[attr.st_ino] = fd
@@ -497,36 +542,42 @@ class Operations(pyfuse3.Operations):
         path_file = self._inode_to_path(fd, fullpath=True)
 
         degoo_file_size = self._get_degoo_element_by_id(fd)['Size']
-        size_to_read = offset + length
 
         first_file_part = offset // self._cache_size
-        second_file_part = first_file_part + 1
-
         temp_filename = self._get_temp_file(path_file, first_file_part)
 
         if not os.path.isfile(temp_filename):
             self._check_requests()
-            # Primary chunk: submit and block until done
             future = self._download_executor.submit(
                 self._cache_file, path_file, first_file_part, degoo_file_size)
             future.result()
 
-        result = size_to_read // self._cache_size
+        # ---------------------------------------------------------------
+        # Multi-chunk lookahead pre-fetch
+        # Pre-fetch the next N chunks asynchronously so they are warm in
+        # the temp directory before the read pointer reaches them.
+        # ---------------------------------------------------------------
+        for ahead in range(1, self._lookahead_chunks + 1):
+            lookahead_part = first_file_part + ahead
+            if lookahead_part * self._cache_size >= degoo_file_size:
+                break  # past end of file — nothing to pre-fetch
+            next_temp = self._get_temp_file(path_file, lookahead_part)
+            if next_temp not in caching_file_list and not os.path.isfile(next_temp):
+                self._check_requests()
+                log.debug('Pre-fetching chunk %d [%s]', lookahead_part, next_temp)
+                caching_file_list.append(next_temp)
+                self._download_executor.submit(
+                    self._cache_file, path_file, lookahead_part, degoo_file_size)
 
+        self.check_and_split_file(path_file)
+
+        # ---------------------------------------------------------------
+        # Serve the bytes from the already-downloaded chunk
+        # ---------------------------------------------------------------
+        result = (offset // self._cache_size)
+        size_to_read = offset + length
+        second_file_part = first_file_part + 1
         next_temp_filename = self._get_temp_file(path_file, second_file_part)
-
-        if self._min_size_read_next_part < size_to_read < degoo_file_size \
-                and second_file_part * self._cache_size < degoo_file_size \
-                and next_temp_filename not in caching_file_list and not os.path.isfile(next_temp_filename):
-            self._check_requests()
-
-            log.debug('Preparing to download next file [%s]', next_temp_filename)
-            caching_file_list.append(next_temp_filename)
-            # Next chunk: submit without blocking (pre-fetch)
-            self._download_executor.submit(
-                self._cache_file, path_file, second_file_part, degoo_file_size)
-
-            self.check_and_split_file(path_file)
 
         if not os.path.isfile(temp_filename):
             raise pyfuse3.FUSEError(errno.ENOENT)
@@ -583,7 +634,6 @@ class Operations(pyfuse3.Operations):
                     pre_cache_parts = [0, 1, last_part]
                     for part in pre_cache_parts:
                         log.debug('Precaching split file %s, part %d', path_file_new_part, part)
-                        # Use pool instead of bare threading.Thread
                         self._download_executor.submit(
                             self._cache_file, path_file_new_part, part, degoo_file_size_new_part)
 
@@ -722,8 +772,21 @@ class Operations(pyfuse3.Operations):
             is_media_type = mimetype_file == 'audio' or mimetype_file == 'video'
         return is_media_type
 
-    def _cache_file(self, degoo_path_file, file_part, degoo_file_size):
-        """Download a chunk of a Degoo file into the local temp directory."""
+    def _cache_file(self, degoo_path_file: str, file_part: int, degoo_file_size: int) -> None:
+        """Download one cache-chunk using multiple parallel sub-range requests.
+
+        Strategy
+        --------
+        Degoo's CDN enforces a per-TCP-connection bandwidth cap of ~8 MB/s.
+        To saturate the available uplink we split each `_cache_size` chunk into
+        `_subchunk_connections` equal sub-ranges and fetch them simultaneously
+        on separate TCP connections (separate urllib3 sockets, all sharing the
+        same Session connection pool).  The sub-range bytes are reassembled
+        in order and written to the temp file as a single contiguous block.
+
+        Falls back to a single-connection download if the server returns 200
+        (full content) instead of 206 (partial content).
+        """
         global caching_file_list
 
         item_id = self._get_degoo_id(degoo_path_file)
@@ -760,42 +823,100 @@ class Operations(pyfuse3.Operations):
             log.debug('Changing hostname [%s] to [%s]', url_parsed.hostname, DEGOO_HOSTNAME_EU)
             url = url_parsed._replace(netloc=DEGOO_HOSTNAME_EU).geturl()
 
-        is_media = self._is_media(degoo_path_file)
-        size = (file_part * self._cache_size) + self._cache_size
-        size = size - 1 if size < degoo_file_size else ''
+        # Byte range for this chunk
+        chunk_start = file_part * self._cache_size
+        chunk_end_inclusive = min(chunk_start + self._cache_size, degoo_file_size) - 1
+        chunk_bytes = chunk_end_inclusive - chunk_start + 1
 
         temp_filename = self._get_temp_file(degoo_path_file, file_part)
 
-        if not os.path.isfile(temp_filename):
-            log.debug('Downloading [%s] filepart %d-%s', temp_filename, file_part * self._cache_size, str(size))
-            try:
-                response = requests.get(url, stream=is_media, headers={
-                    'Range': 'bytes=%s-%s' % (file_part * self._cache_size, size)
-                })
+        if os.path.isfile(temp_filename):
+            log.debug('Chunk already on disk [%s]', temp_filename)
+            if temp_filename in caching_file_list:
+                caching_file_list.remove(temp_filename)
+            return
 
-                if response.status_code < 400:
-                    if response.status_code == 206:
-                        read_bytes = response.content
-                    else:
-                        log.debug('WARN. File is returned completely by Degoo. Ignoring')
-                        raise pyfuse3.FUSEError(errno.ENOENT)
+        n = self._subchunk_connections
+        # Minimum sub-chunk size: 256 KB — don't open 8 connections for a tiny tail chunk.
+        min_subchunk = 256 * 1024
+        if chunk_bytes < min_subchunk * n:
+            n = max(1, chunk_bytes // min_subchunk)
 
-                    with open(temp_filename, 'wb') as out:
-                        out.write(read_bytes)
+        sub_size = chunk_bytes // n
+        # Build list of (start, end_inclusive) byte ranges for each sub-chunk
+        ranges = []
+        for i in range(n):
+            s = chunk_start + i * sub_size
+            e = (chunk_start + (i + 1) * sub_size - 1) if i < n - 1 else chunk_end_inclusive
+            ranges.append((s, e))
 
-                    log.debug('Downloaded file [%s]', temp_filename)
-                else:
-                    log.debug('Error trying to download file [%s]. Code [%s] Message [%s]', temp_filename,
-                              str(response.status_code), response.content)
-            except requests.exceptions.ConnectionError as e:
-                log.debug('Error getting info for file [%s]: %s', temp_filename, str(e))
-            except urllib3.exceptions.ReadTimeoutError as e:
-                log.debug('Timeout for file [%s]: %s', temp_filename, str(e))
-        else:
-            log.debug('The file [%s] is already downloaded', temp_filename)
+        log.debug(
+            'Downloading chunk %d [bytes %d-%d] via %d parallel sub-ranges',
+            file_part, chunk_start, chunk_end_inclusive, n
+        )
 
-        if temp_filename in caching_file_list:
-            caching_file_list.remove(temp_filename)
+        def _fetch_range(byte_start: int, byte_end: int) -> tuple:
+            """Fetch a single byte sub-range; returns (byte_start, data)."""
+            resp = _http_session.get(
+                url,
+                headers={'Range': f'bytes={byte_start}-{byte_end}'},
+                timeout=(10, 60),
+                stream=False,
+            )
+            if resp.status_code == 206:
+                return (byte_start, resp.content)
+            if resp.status_code == 200:
+                # Server ignored the Range header and sent the whole file.
+                # Slice out only the bytes we need.
+                data = resp.content
+                local_start = byte_start - chunk_start
+                local_end   = byte_end   - chunk_start + 1
+                return (byte_start, data[local_start:local_end])
+            resp.raise_for_status()
+
+        try:
+            # Use a *dedicated* inner executor so sub-chunk futures don't
+            # starve the outer chunk-level pool.
+            with ThreadPoolExecutor(
+                max_workers=n, thread_name_prefix="degoo-sub"
+            ) as sub_pool:
+                futures = {
+                    sub_pool.submit(_fetch_range, s, e): (s, e)
+                    for s, e in ranges
+                }
+                results = {}  # byte_start -> data
+                for fut in as_completed(futures):
+                    s, _ = futures[fut]
+                    try:
+                        start_pos, data = fut.result()
+                        results[start_pos] = data
+                    except Exception as exc:
+                        log.debug(
+                            'Sub-range [%d-%d] failed for [%s]: %s',
+                            s, futures[fut][1], temp_filename, exc
+                        )
+                        raise
+
+            # Reassemble in order and write atomically
+            assembled = b''.join(results[s] for s, _ in ranges)
+            tmp_write = temp_filename + '.tmp'
+            with open(tmp_write, 'wb') as out:
+                out.write(assembled)
+            os.replace(tmp_write, temp_filename)  # atomic on POSIX
+
+            log.debug('Downloaded chunk [%s] (%d bytes)', temp_filename, len(assembled))
+
+        except Exception as exc:
+            log.debug('Error downloading chunk [%s]: %s', temp_filename, exc)
+            # Clean up any partial file so a retry will re-attempt
+            for leftover in (temp_filename, temp_filename + '.tmp'):
+                try:
+                    os.remove(leftover)
+                except FileNotFoundError:
+                    pass
+        finally:
+            if temp_filename in caching_file_list:
+                caching_file_list.remove(temp_filename)
 
     def _get_temp_directory(self):
         temp_directory = os.path.join(tempfile.gettempdir(), 'degoo')
@@ -945,8 +1066,8 @@ def parse_args(args):
                         help='Used when token expires. Alternative if login fails')
     parser.add_argument('--degoo-path', type=str, default=PATH_ROOT_DEGOO,
                         help='Absolute path from Degoo. Default is ' + PATH_ROOT_DEGOO)
-    parser.add_argument('--cache-size', type=int, default=15,
-                        help='Size of downloaded chunk in MB')
+    parser.add_argument('--cache-size', type=int, default=128,
+                        help='Size of each downloaded chunk in MB (default: 128)')
     parser.add_argument('--debug', action='store_true', default=False,
                         help='Enable debugging output')
     parser.add_argument('--debug-fuse', action='store_true', default=False,
@@ -975,7 +1096,20 @@ def parse_args(args):
     parser.add_argument('--plex-split-file', action='store_true', default=False,
                         help='Check if there are split files to cache the first part')
     parser.add_argument('--download-threads', type=int, default=8,
-                        help='Number of parallel download threads (default: 8)')
+                        help='Number of parallel chunk-download threads (default: 8)')
+    parser.add_argument('--subchunk-connections', type=int, default=_DEFAULT_SUBCHUNK_CONNECTIONS,
+                        help=(
+                            'Number of parallel TCP connections used to download a single '
+                            'chunk (default: %(default)s). Each connection fetches an equal '
+                            'sub-range; raising this value multiplies the per-chunk throughput '
+                            'up to your line speed.'
+                        ))
+    parser.add_argument('--lookahead-chunks', type=int, default=2,
+                        help=(
+                            'Number of chunks to pre-fetch ahead of the current read position '
+                            '(default: 2). Higher values reduce stalls on sequential reads at '
+                            'the cost of extra memory and temp-disk usage.'
+                        ))
 
     return parser.parse_args(args)
 
@@ -1001,28 +1135,32 @@ def main():
     config_path = options.config_path
     plex_split_file = options.plex_split_file
     download_threads = options.download_threads
+    subchunk_connections = options.subchunk_connections
+    lookahead_chunks = options.lookahead_chunks
 
     log.debug('##### Initializing Degoo drive (cligoo backend) #####')
-    log.debug('Local mount point:   %s', options.mountpoint)
-    log.debug('Cache size:          %s MB', str(options.cache_size))
-    log.debug('Download threads:    %d', download_threads)
+    log.debug('Local mount point:      %s', options.mountpoint)
+    log.debug('Cache chunk size:       %s MB', str(options.cache_size))
+    log.debug('Download threads:       %d', download_threads)
+    log.debug('Sub-chunk connections:  %d', subchunk_connections)
+    log.debug('Lookahead chunks:       %d', lookahead_chunks)
     if degoo_email and degoo_pass:
-        log.debug('Degoo email:         %s', degoo_email)
-        log.debug('Degoo pass:          %s', '*' * len(degoo_pass))
+        log.debug('Degoo email:            %s', degoo_email)
+        log.debug('Degoo pass:             %s', '*' * len(degoo_pass))
     if degoo_refresh_token:
-        log.debug('Degoo refresh token: %s', '*' * len(degoo_refresh_token[:10]))
-    log.debug('Root Degoo path:     %s', degoo_path)
-    log.debug('Refresh interval:    %s', 'Disabled' if disable_refresh else str(refresh_interval) + ' seconds')
-    log.debug('Flood control:       %s', 'Enabled' if enable_flood_control else 'Disabled')
+        log.debug('Degoo refresh token:    %s', '*' * len(degoo_refresh_token[:10]))
+    log.debug('Root Degoo path:        %s', degoo_path)
+    log.debug('Refresh interval:       %s', 'Disabled' if disable_refresh else str(refresh_interval) + ' seconds')
+    log.debug('Flood control:          %s', 'Enabled' if enable_flood_control else 'Disabled')
     if enable_flood_control:
-        log.debug('Flood sleep time:    %s seconds', str(options.flood_sleep_time))
-        log.debug('Flood max requests:  %s', str(options.flood_max_requests))
-        log.debug('Flood time check:    %s minute(s)', str(options.flood_time_to_check))
-    log.debug('Change hostname:     %s', 'Disabled' if not change_hostname else DEGOO_HOSTNAME_EU)
-    log.debug('Search split files:  %s', 'Enabled' if plex_split_file else 'Disabled')
-    log.debug('Mode:                %s', mode)
+        log.debug('Flood sleep time:       %s seconds', str(options.flood_sleep_time))
+        log.debug('Flood max requests:     %s', str(options.flood_max_requests))
+        log.debug('Flood time check:       %s minute(s)', str(options.flood_time_to_check))
+    log.debug('Change hostname:        %s', 'Disabled' if not change_hostname else DEGOO_HOSTNAME_EU)
+    log.debug('Search split files:     %s', 'Enabled' if plex_split_file else 'Disabled')
+    log.debug('Mode:                   %s', mode)
     if config_path:
-        log.debug('Configuration path:  %s', config_path)
+        log.debug('Configuration path:     %s', config_path)
 
     if config_path:
         import cligoo.config as _cfg_mod
@@ -1031,7 +1169,14 @@ def main():
         _cfg_mod.TOML_FILE = _cfg_mod.CONFIG_DIR / 'config.toml'
         _cfg_mod.CONFIG_FILE = _cfg_mod.CONFIG_DIR / 'config.json'
 
-    # Authenticate via cligoo (login replaces the old login_password)
+    # Build the shared HTTP session (large connection pool for parallel sub-ranges)
+    global _http_session
+    _http_session = _make_http_session(
+        pool_connections=download_threads,
+        pool_maxsize=download_threads * subchunk_connections + 4,
+    )
+
+    # Authenticate via cligoo
     global _client
     if degoo_email and degoo_pass:
         log.debug('Logging in with email/password via cligoo...')
@@ -1055,6 +1200,8 @@ def main():
         mode=mode,
         plex_split_file=plex_split_file,
         download_threads=download_threads,
+        subchunk_connections=subchunk_connections,
+        lookahead_chunks=lookahead_chunks,
     )
 
     log.debug('Reading Degoo content from directory %s', degoo_path)

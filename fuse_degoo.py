@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""fuse_degoo.py — FUSE driver for Degoo cloud storage.
+
+Updated to use cligoo (https://github.com/marcomc/cligoo) as the Degoo API
+backend instead of the bundled degoo/__init__.py module.
+
+Original degoo_drive: https://github.com/Laitinlok/degoo_drive
+cligoo API:           https://github.com/marcomc/cligoo
+"""
 
 import datetime
 import errno
@@ -25,7 +33,11 @@ import urllib3
 import re
 from pyfuse3 import FUSEError
 
-import degoo
+# ---------------------------------------------------------------------------
+# cligoo integration
+# ---------------------------------------------------------------------------
+from cligoo.api import DegooClient, DegooAPIError
+from cligoo.auth import get_token, AuthError, login_password
 
 # to load the module from there first.
 basedir = os.path.abspath(os.path.join(os.path.dirname(sys.argv[0]), '..'))
@@ -37,24 +49,90 @@ faulthandler.enable()
 
 log = logging.getLogger(__name__)
 
+# Global tree cache: {int(item_id): item_dict}
+# item_dict keys: ID, Name, FilePath, Size, ParentID, isFolder,
+#                 LastUploadTime, LastModificationTime, CreationTime, URL
 degoo_tree_content = {}
 
+# Global cligoo client (initialised in main())
+_client: DegooClient = None  # type: ignore[assignment]
+
 LOCAL_PATH_DEGOO = '/home/degoo'
-
 PATH_ROOT_DEGOO = '/'
-
 DEGOO_HOSTNAME_EU = 'c.degoo.eu'
 
 percentage_read = 25
-
 is_refresh_enabled = True
-
 caching_file_list = []
-
 threadLock = threading.Lock()
-
 requests_control = []
 
+
+# ---------------------------------------------------------------------------
+# Helpers to adapt cligoo item dicts to the format degoo_drive expects
+# ---------------------------------------------------------------------------
+
+def _cligoo_item_to_tree(item: dict, parent_path: str) -> dict:
+    """Convert a cligoo list_dir item to the degoo_tree_content format.
+
+    degoo_drive expects items to carry a ``FilePath`` (absolute path from the
+    Degoo root) and a boolean ``isFolder``.  cligoo returns ``Category``
+    (int) instead of ``isFolder``, and does not pre-compute the path.
+    """
+    name = item.get('Name', '')
+    file_path = parent_path.rstrip('/') + '/' + name if parent_path != '/' else '/' + name
+    is_folder = _client.is_folder(item)
+    return {
+        'ID': int(item['ID']),
+        'Name': name,
+        'FilePath': file_path,
+        'Size': int(item.get('Size') or 0),
+        'ParentID': int(item.get('ParentID') or 0),
+        'isFolder': is_folder,
+        'LastUploadTime': item.get('LastUploadTime'),
+        'LastModificationTime': item.get('LastModificationTime'),
+        'CreationTime': item.get('CreationTime'),
+        'URL': item.get('URL') or item.get('OptimizedURL') or item.get('ThumbnailURL'),
+        'Category': item.get('Category', 0),
+    }
+
+
+def _build_tree_recursive(parent_id: int, parent_path: str, mode: str) -> None:
+    """Populate degoo_tree_content by recursing through cligoo's list_dir.
+
+    In 'lazy' mode only the direct children are fetched; sub-folders are not
+    expanded until readdir() is called on them.  In 'full' (eager) mode the
+    entire tree under *parent_id* is downloaded upfront.
+    """
+    global degoo_tree_content
+
+    items = _client.list_dir(str(parent_id), limit=None)
+    for item in items:
+        parent_entry = degoo_tree_content.get(parent_id)
+        p_path = parent_entry['FilePath'] if parent_entry else parent_path
+        entry = _cligoo_item_to_tree(item, p_path)
+        degoo_tree_content[entry['ID']] = entry
+
+        if mode != 'lazy' and entry['isFolder']:
+            _build_tree_recursive(entry['ID'], entry['FilePath'], mode)
+
+
+def _fetch_dir_if_needed(dir_id: int, mode: str) -> None:
+    """Fetch children of *dir_id* from the API if not yet loaded (lazy mode)."""
+    if mode == 'lazy':
+        # Check if we already have children for this directory
+        has_children = any(
+            e['ParentID'] == dir_id for e in degoo_tree_content.values()
+        )
+        if not has_children:
+            parent = degoo_tree_content.get(dir_id)
+            p_path = parent['FilePath'] if parent else '/'
+            _build_tree_recursive(dir_id, p_path, 'lazy')
+
+
+# ---------------------------------------------------------------------------
+# FUSE Operations
+# ---------------------------------------------------------------------------
 
 class Operations(pyfuse3.Operations):
     enable_writeback_cache = True
@@ -72,15 +150,10 @@ class Operations(pyfuse3.Operations):
         self._fd_buffer_length = dict()
         self._cache_size = cache_size
         self._min_size_read_next_part = (percentage_read * self._cache_size) / 100
-        # Waiting time before resuming requests once the maximum has been reached
         self._flood_sleep_time = flood_sleep_time
-        # Request control period
         self._flood_time_to_check = flood_time_to_check
-        # Maximum number of requests in the period set by the variable "_flood_time_to_check"
         self._flood_max_requests = flood_max_requests
-        # Disable flood control
         self._enable_flood_control = enable_flood_control
-        # Change hostname sent by Degoo for .eu
         self._change_hostname = change_hostname
         self._mode = mode
         self._plex_split_file = plex_split_file
@@ -104,7 +177,6 @@ class Operations(pyfuse3.Operations):
             val = val[val.rfind('/') + 1:]
 
         if isinstance(val, set):
-            # In case of hardlinks, pick any path
             val = next(iter(val))
         return val
 
@@ -112,7 +184,6 @@ class Operations(pyfuse3.Operations):
         log.debug('_add_path for %d, %s', inode, path)
         self._lookup_cnt[inode] += 1
 
-        # With hardlinks, one inode may map to multiple paths.
         if inode not in self._inode_path_map:
             self._inode_path_map[inode] = path
             return
@@ -133,7 +204,7 @@ class Operations(pyfuse3.Operations):
             del self._lookup_cnt[inode]
             try:
                 del self._inode_path_map[inode]
-            except KeyError:  # may have been deleted
+            except KeyError:
                 pass
 
     async def lookup(self, inode_p, name, ctx=None):
@@ -282,9 +353,9 @@ class Operations(pyfuse3.Operations):
         parent_id = self._get_degoo_id(path)
         children = self._get_degoo_childs(parent_id)
 
-        # If dir has not children and it is lazy mode, degoo it is called to get the content
+        # If dir has no children and it is lazy mode, fetch from API
         if self._mode == 'lazy' and len(children) == 0:
-            degoo.tree(dir_id=inode, mode=self._mode)
+            _fetch_dir_if_needed(parent_id, self._mode)
             self._refresh_path()
             children = self._get_degoo_childs(parent_id)
 
@@ -306,9 +377,12 @@ class Operations(pyfuse3.Operations):
         parent = self._inode_to_path(inode_p, fullpath=True)
         path = parent + '/' + name
 
-        # Get the id to file to delete to avoid duplicates with name
         file_id = self._get_degoo_id(path)
-        degoo.rm(file_id)
+        # cligoo: client.delete([str(file_id)])
+        _client.delete([str(file_id)])
+        # Remove from local tree cache
+        if file_id in degoo_tree_content:
+            del degoo_tree_content[file_id]
 
         if file_id in self._lookup_cnt:
             self._forget_path(file_id, path)
@@ -318,9 +392,10 @@ class Operations(pyfuse3.Operations):
         parent = self._inode_to_path(inode_p, fullpath=True)
         path = parent + '/' + name
 
-        # Get the id to file to delete to avoid duplicates with name
         file_id = self._get_degoo_id(path)
-        degoo.rm(file_id)
+        _client.delete([str(file_id)])
+        if file_id in degoo_tree_content:
+            del degoo_tree_content[file_id]
 
         if file_id in self._lookup_cnt:
             self._forget_path(file_id, path)
@@ -349,21 +424,34 @@ class Operations(pyfuse3.Operations):
         inode = self._get_degoo_id(path_old)
 
         if self._mode == 'lazy' and len(self._get_degoo_childs(inode_p_new)) == 0:
-            degoo.tree(dir_id=inode_p_new, mode=self._mode)
+            _fetch_dir_if_needed(inode_p_new, self._mode)
             self._refresh_path()
 
-        # It is a rename
+        # It is a rename within the same directory
         if inode_p_old == inode_p_new:
-            degoo.rename(path_old, name_new)
+            _client.rename(str(inode), name_new)
+            # Update tree cache
+            if inode in degoo_tree_content:
+                old_fp = degoo_tree_content[inode]['FilePath']
+                new_fp = old_fp[:old_fp.rfind('/') + 1] + name_new
+                degoo_tree_content[inode]['Name'] = name_new
+                degoo_tree_content[inode]['FilePath'] = new_fp
         else:
-            # If name it is different, it is a move with rename
+            # Move (optionally with rename)
             if name_old != name_new:
-                degoo.rename(path_old, name_new)
-                path_old = path + '/' + name_new
-            path = self._inode_to_path(inode_p_new, fullpath=True)
-            degoo.mv(path_old, path)
+                _client.rename(str(inode), name_new)
+                if inode in degoo_tree_content:
+                    degoo_tree_content[inode]['Name'] = name_new
+            # Move to new parent
+            _client.move([str(inode)], str(inode_p_new))
+            # Update FilePath in tree cache
+            if inode in degoo_tree_content:
+                new_parent_path = self._inode_to_path(inode_p_new, fullpath=True)
+                new_fp = new_parent_path.rstrip('/') + '/' + name_new
+                degoo_tree_content[inode]['FilePath'] = new_fp
+                degoo_tree_content[inode]['ParentID'] = inode_p_new
 
-        path_new = path + '/' + name_new
+        path_new = self._inode_to_path(inode_p_new, fullpath=True) + '/' + name_new
 
         val = self._inode_path_map[inode]
         if isinstance(val, set):
@@ -376,21 +464,27 @@ class Operations(pyfuse3.Operations):
 
     async def mkdir(self, inode_p, name, mode, ctx):
         name = fsdecode(name)
-        # Obtains the path to the directory where the new directory is to be created
         base_path = self._inode_to_path(inode_p)
-        # Obtains the id of the directory where it will be created.
         element_id = self._get_degoo_id(base_path)
 
         log.debug('Creating directory \'%s\' in Degoo path \'%s\'', name, base_path)
 
-        # It is created in Degoo
-        new_dir_id = degoo.mkdir(name, element_id)
+        # cligoo: client.mkdir(name, parent_id) → returns result (not the new ID directly)
+        _client.mkdir(name, str(element_id))
 
-        new_dir_element = self._get_degoo_element_by_id(new_dir_id)
+        # Retrieve the newly created folder from the API
+        new_dir_item = _client.resolve_path_under(str(element_id), name)
+        if not new_dir_item:
+            raise FUSEError(errno.EIO)
 
-        # Get the attributes of new directory
-        attr = self._get_degoo_attrs(new_dir_element['Name'])
-        self._add_path(attr.st_ino, new_dir_element['FilePath'])
+        parent_entry = degoo_tree_content.get(element_id)
+        p_path = parent_entry['FilePath'] if parent_entry else base_path
+        new_entry = _cligoo_item_to_tree(new_dir_item, p_path)
+        new_dir_id = new_entry['ID']
+        degoo_tree_content[new_dir_id] = new_entry
+
+        attr = self._get_degoo_attrs(new_entry['FilePath'])
+        self._add_path(attr.st_ino, new_entry['FilePath'])
 
         return attr
 
@@ -422,7 +516,6 @@ class Operations(pyfuse3.Operations):
         first_file_part = offset // self._cache_size
         second_file_part = first_file_part + 1
 
-        # Get the filename
         temp_filename = self._get_temp_file(path_file, first_file_part)
 
         if not os.path.isfile(temp_filename):
@@ -433,8 +526,6 @@ class Operations(pyfuse3.Operations):
 
         next_temp_filename = self._get_temp_file(path_file, second_file_part)
 
-        # 1 - Check that at least a percentage of the file has been read before downloading the next piece of data
-        # 2 - Check that the size to be read is smaller than the size of the file
         if self._min_size_read_next_part < size_to_read < degoo_file_size \
                 and second_file_part * self._cache_size < degoo_file_size \
                 and next_temp_filename not in caching_file_list and not os.path.isfile(next_temp_filename):
@@ -445,15 +536,12 @@ class Operations(pyfuse3.Operations):
             t1 = threading.Thread(target=self._cache_file, args=(path_file, second_file_part, degoo_file_size,))
             t1.start()
 
-            # If a file is split, plex plays them as one if they meet a certain pattern
-            # This function checks and downloads if this happens to avoid skips in the playback
             self.check_and_split_file(path_file)
 
         if not os.path.isfile(temp_filename):
             raise pyfuse3.FUSEError(errno.ENOENT)
 
         file_descriptor = os.open(temp_filename, os.O_RDONLY)
-        # If the reading is done from the same file
         if offset - (result * self._cache_size) >= 0:
             os.lseek(file_descriptor, offset - (result * self._cache_size), os.SEEK_SET)
             byte = os.read(file_descriptor, length)
@@ -461,16 +549,13 @@ class Operations(pyfuse3.Operations):
         else:
             log.debug('Reading first part from two files. File 1 [%s]', temp_filename)
 
-            # Otherwise, there is a part that is read from one file, and the next from another
             part_offset = self._cache_size - ((result * self._cache_size) - offset)
             os.lseek(file_descriptor, part_offset, os.SEEK_SET)
-            # The reading is made from where it corresponds to the end of the file
             byte = os.read(file_descriptor, self._cache_size - length)
             os.close(file_descriptor)
 
             log.debug('Reading second part from two files. File 2 [%s]', next_temp_filename)
 
-            # All files are deleted, except the one to be read
             self._clear_files(path_file, skip_filename=next_temp_filename)
 
             retries = 0
@@ -482,7 +567,6 @@ class Operations(pyfuse3.Operations):
             if not os.path.isfile(next_temp_filename):
                 raise pyfuse3.FUSEError(errno.ENOENT)
 
-            # The rest of the contents of the following file are read
             file_descriptor = os.open(next_temp_filename, os.O_RDONLY)
             os.lseek(file_descriptor, 0, os.SEEK_SET)
             byte += os.read(file_descriptor, length - len(byte))
@@ -528,7 +612,6 @@ class Operations(pyfuse3.Operations):
             children = self._get_degoo_childs(folder_id)
             next_part = int(match.group().replace(match.group(1), '')) + 1
 
-            # Search next split file
             for element in children:
                 match = re.search(r'(cd|disc|disk|dvd|part|pt)' + str(next_part), element['Name'])
                 if match:
@@ -553,19 +636,32 @@ class Operations(pyfuse3.Operations):
             log.debug('Uploading file [%s] to Degoo path [%s]', filename, target_path)
 
             try:
-                degoo_id, path, url = degoo.put(source_file, target_path)
+                # Resolve the target folder's Degoo ID
+                target_id = self._get_degoo_id(target_path)
+                file_id = _client.upload(source_file, str(target_id), name=filename)
 
-                log.debug('Upload of file [%s] finished. Id [%s] Url [%s]', filename, degoo_id, url)
+                # Fetch the newly uploaded item to populate the tree cache
+                new_item = _client.resolve_path_under(str(target_id), filename)
+                if new_item:
+                    parent_entry = degoo_tree_content.get(target_id)
+                    p_path = parent_entry['FilePath'] if parent_entry else target_path
+                    new_entry = _cligoo_item_to_tree(new_item, p_path)
+                    degoo_tree_content[new_entry['ID']] = new_entry
+                    path = new_entry['FilePath']
+                    url = new_entry.get('URL', '')
+                else:
+                    path = target_path.rstrip('/') + '/' + filename
+                    url = ''
+
+                log.debug('Upload of file [%s] finished. Id [%s] Url [%s]', filename, file_id, url)
 
                 if not url:
                     log.debug('WARN: file [%s] has not been uploaded successfully', filename)
 
-                # Get the attributes of the new directory
                 attr = self._get_degoo_attrs(path)
                 self._add_path(attr.st_ino, path)
-            except degoo.DegooError as e:
-                log.debug('ERROR uploading file [{}]: {}'.format(filename, e.msg))
-                pass
+            except DegooAPIError as e:
+                log.debug('ERROR uploading file [{}]: {}'.format(filename, str(e)))
 
         return length
 
@@ -584,7 +680,7 @@ class Operations(pyfuse3.Operations):
             self._clear_files(filename)
 
             return
-        except:
+        except Exception:
             pass
 
         if self._fd_open_count[fd] > 1:
@@ -635,14 +731,35 @@ class Operations(pyfuse3.Operations):
         mimetype_file = mimetypes.guess_type(filename)[0]
         if mimetype_file is not None:
             mimetype_file = mimetype_file.split('/')[0]
-
             is_media_type = mimetype_file == 'audio' or mimetype_file == 'video'
         return is_media_type
 
     def _cache_file(self, degoo_path_file, file_part, degoo_file_size):
+        """Download a chunk of a Degoo file into the local temp directory.
+
+        Uses cligoo's get_item() to obtain the download URL instead of the
+        old degoo.get_url_file() call.
+        """
         global caching_file_list
 
-        url = degoo.get_url_file(degoo_path_file)
+        # Resolve the Degoo item ID for this path
+        item_id = self._get_degoo_id(degoo_path_file)
+        if item_id is None:
+            log.debug('WARN: No item ID for path %s', degoo_path_file)
+            raise pyfuse3.FUSEError(errno.ENOENT)
+
+        # Check tree cache first; fall back to API call
+        cached = degoo_tree_content.get(item_id, {})
+        url = cached.get('URL')
+        if not url:
+            try:
+                item = _client.get_item(str(item_id))
+                url = item.get('URL') or item.get('OptimizedURL') or item.get('ThumbnailURL')
+                # Cache the URL for future reads
+                if item_id in degoo_tree_content:
+                    degoo_tree_content[item_id]['URL'] = url
+            except DegooAPIError as e:
+                log.debug('Error getting info for file [%s]: %s', degoo_path_file, str(e))
 
         if not url:
             log.debug('WARN: No url for file %s', degoo_path_file)
@@ -650,26 +767,22 @@ class Operations(pyfuse3.Operations):
 
         url_parsed = urlparse(url)
 
-        # the degoo.get_url_file() will return the content of small text files
+        # Handle non-URL responses (raw content for small text files)
         if not url_parsed.scheme:
             temp_filename = self._get_temp_file(degoo_path_file, file_part)
             with open(temp_filename, 'wb') as out:
-                out.write(url)
+                out.write(url if isinstance(url, bytes) else url.encode())
             if temp_filename in caching_file_list:
                 caching_file_list.remove(temp_filename)
             return
-        
-        # It seems to go faster with the .eu domain
+
+        # Optionally redirect to the EU endpoint for faster downloads
         if self._change_hostname and 'degoo' in url_parsed.hostname and url_parsed.hostname != DEGOO_HOSTNAME_EU:
             log.debug('Changing hostname [%s] to [%s]', url_parsed.hostname, DEGOO_HOSTNAME_EU)
             url = url_parsed._replace(netloc=DEGOO_HOSTNAME_EU).geturl()
 
         is_media = self._is_media(degoo_path_file)
-
         size = (file_part * self._cache_size) + self._cache_size
-
-        # For end of file, must by "degoo_file_size - (file_part * self._cache_size)", but Degoo returns 416.
-        # With empty size returns from "file_part * self._cache_size" until the end
         size = size - 1 if size < degoo_file_size else ''
 
         temp_filename = self._get_temp_file(degoo_path_file, file_part)
@@ -715,7 +828,6 @@ class Operations(pyfuse3.Operations):
         filename = path_file
         if '/' in filename:
             filename = filename[filename.rfind('/') + 1:]
-
         return filename
 
     def _get_temp_file(self, degoo_path_file, filepart):
@@ -723,7 +835,6 @@ class Operations(pyfuse3.Operations):
         name = filename[:filename.rfind('.')]
         extension = filename[filename.rfind('.') + 1:]
         temp_filename = name + '_' + str(filepart) + '.' + extension
-
         return os.path.join(self._get_temp_directory(), temp_filename)
 
     def _clear_files(self, filename, skip_filename=None):
@@ -748,11 +859,9 @@ class Operations(pyfuse3.Operations):
                 inode = attr.st_ino
                 path = degoo_element['FilePath']
 
-                # If path does not exist, it is added
                 if inode not in self._inode_path_map:
                     self._add_path(inode, path)
                 elif inode in self._inode_path_map and self._inode_path_map[inode] != path:
-                    # If the element exists, but has changed its path
                     del self._inode_path_map[inode]
                     self._add_path(inode, path)
 
@@ -793,15 +902,42 @@ class Operations(pyfuse3.Operations):
         threadLock.acquire()
 
         global degoo_tree_content
-        degoo_tree_content = degoo.tree_cache(mode=self._mode)
 
-        id_root_degoo = self._get_degoo_id(self._source)
+        # Build a root entry so FilePath resolution works from '/'
+        root_item = _client.resolve_path(self._source)
+        if root_item is None:
+            raise RuntimeError(f'Degoo path not found: {self._source}')
+
+        root_id = int(root_item['ID'])
+        # Construct a synthetic root entry
+        root_entry = {
+            'ID': root_id,
+            'Name': root_item.get('Name', self._source.rstrip('/').rsplit('/', 1)[-1] or '/'),
+            'FilePath': self._source,
+            'Size': 0,
+            'ParentID': int(root_item.get('ParentID') or 0),
+            'isFolder': True,
+            'LastUploadTime': None,
+            'LastModificationTime': None,
+            'CreationTime': None,
+            'URL': None,
+            'Category': root_item.get('Category', 2),
+        }
+        degoo_tree_content = {root_id: root_entry}
+
+        # Populate tree (respecting lazy / full mode)
+        _build_tree_recursive(root_id, self._source, self._mode)
+
+        id_root_degoo = root_id
         self._set_id_root_degoo(id_root_degoo)
-
         self._refresh_path()
 
         threadLock.release()
 
+
+# ---------------------------------------------------------------------------
+# Logging / argument parsing
+# ---------------------------------------------------------------------------
 
 def init_logging(debug=False):
     formatter = logging.Formatter('%(asctime)s.%(msecs)03d %(threadName)s: '
@@ -834,7 +970,7 @@ def parse_args(args):
     parser.add_argument('--degoo-path', type=str, default=PATH_ROOT_DEGOO,
                         help='Absolute path from Degoo. Default is ' + PATH_ROOT_DEGOO)
     parser.add_argument('--cache-size', type=int, default=15,
-                        help='Size of downloaded chunk')
+                        help='Size of downloaded chunk in MB')
     parser.add_argument('--debug', action='store_true', default=False,
                         help='Enable debugging output')
     parser.add_argument('--debug-fuse', action='store_true', default=False,
@@ -842,7 +978,7 @@ def parse_args(args):
     parser.add_argument('--allow-other', action='store_true',
                         help='Allow access to another users')
     parser.add_argument('--refresh-interval', type=int, default=10,
-                        help='Refresh degoo content interval (default: 1 * 60sec')
+                        help='Refresh degoo content interval (default: 10 * 60sec)')
     parser.add_argument('--disable-refresh', action='store_true', default=False,
                         help='Disable automatic refresh')
     parser.add_argument('--flood-sleep-time', action='store_true', default=60,
@@ -852,19 +988,23 @@ def parse_args(args):
     parser.add_argument('--flood-time-to-check', action='store_true', default=1,
                         help='Request control period, in minutes')
     parser.add_argument('--enable-flood-control', action='store_true', default=False,
-                        help='Disable flood control')
+                        help='Enable flood control')
     parser.add_argument('--change-hostname', action='store_true', default=False,
-                        help='Disable change domain for media files')
+                        help='Change domain for media files to EU endpoint')
     parser.add_argument('--mode', type=str, default='lazy',
                         help='How content is read. Default is lazy')
     parser.add_argument('--config-path', type=str,
-                        help='Path to the configuration files. Default is ~/.config/degoo/ (useful for setting up '
-                             'multiple accounts at the same time, for example)')
+                        help='Path to the cligoo configuration directory '
+                             '(default: ~/.config/cligoo/)')
     parser.add_argument('--plex-split-file', action='store_true', default=False,
                         help='Check if there are split files to cache the first part')
 
     return parser.parse_args(args)
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     options = parse_args(sys.argv[1:])
@@ -883,14 +1023,14 @@ def main():
     config_path = options.config_path
     plex_split_file = options.plex_split_file
 
-    log.debug('##### Initializing Degoo drive #####')
+    log.debug('##### Initializing Degoo drive (cligoo backend) #####')
     log.debug('Local mount point:   %s', options.mountpoint)
-    log.debug('Cache size:          %s', str(cache_size) + ' kb')
+    log.debug('Cache size:          %s MB', str(options.cache_size))
     if degoo_email and degoo_pass:
         log.debug('Degoo email:         %s', degoo_email)
-        log.debug('Degoo pass:          %s', '*'*len(degoo_pass))
+        log.debug('Degoo pass:          %s', '*' * len(degoo_pass))
     if degoo_refresh_token:
-        log.debug('Degoo refresh token: %s', '*'*len(degoo_refresh_token[:10]))
+        log.debug('Degoo refresh token: %s', '*' * len(degoo_refresh_token[:10]))
     log.debug('Root Degoo path:     %s', degoo_path)
     log.debug('Refresh interval:    %s', 'Disabled' if disable_refresh else str(refresh_interval) + ' seconds')
     log.debug('Flood control:       %s', 'Enabled' if enable_flood_control else 'Disabled')
@@ -904,20 +1044,40 @@ def main():
     if config_path:
         log.debug('Configuration path:  %s', config_path)
 
+    # Override cligoo config dir if --config-path was provided
+    if config_path:
+        import cligoo.config as _cfg_mod
+        from pathlib import Path as _Path
+        _cfg_mod.CONFIG_DIR = _Path(config_path)
+        _cfg_mod.TOML_FILE = _cfg_mod.CONFIG_DIR / 'config.toml'
+        _cfg_mod.CONFIG_FILE = _cfg_mod.CONFIG_DIR / 'config.json'
+
+    # Authenticate via cligoo
+    global _client
+    if degoo_email and degoo_pass:
+        log.debug('Logging in with email/password via cligoo...')
+        login_password(degoo_email, degoo_pass)
+
+    _client = DegooClient(debug=options.debug)
+
     if options.allow_other:
-        log.debug('User access:         %s', options.allow_other)
+        log.debug('User access:         allow_other')
 
     Path(options.mountpoint).mkdir(parents=True, exist_ok=True)
 
-    operations = Operations(source=degoo_path, cache_size=cache_size, flood_sleep_time=options.flood_sleep_time,
-                            flood_time_to_check=options.flood_time_to_check,
-                            flood_max_requests=options.flood_max_requests, enable_flood_control=enable_flood_control,
-                            change_hostname=change_hostname, mode=mode, plex_split_file=plex_split_file)
+    operations = Operations(
+        source=degoo_path,
+        cache_size=cache_size,
+        flood_sleep_time=options.flood_sleep_time,
+        flood_time_to_check=options.flood_time_to_check,
+        flood_max_requests=options.flood_max_requests,
+        enable_flood_control=enable_flood_control,
+        change_hostname=change_hostname,
+        mode=mode,
+        plex_split_file=plex_split_file,
+    )
 
     log.debug('Reading Degoo content from directory %s', degoo_path)
-
-    degoo.DegooConfig(config_path, email=degoo_email, password=degoo_pass, refresh_token=degoo_refresh_token)
-    degoo.API()
     operations.load_degoo_content()
 
     log.debug('Mounting...')

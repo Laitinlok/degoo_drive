@@ -43,6 +43,7 @@ DEFAULT_SETTINGS = {
     "lookahead_chunks": 2,
     "chunk_max_age": 3600,
     "start_on_launch": True,
+    "allow_other": False,
     "db_path": str(Path.home() / ".cache" / "degoo_drive" / "tree_cache.db"),
     "chunk_cache_dir": str(Path.home() / ".cache" / "degoo_drive" / "chunks"),
 }
@@ -140,8 +141,14 @@ class MountWorker(QThread):
             "--db-path",              s["db_path"],
             "--chunk-cache-dir",      s["chunk_cache_dir"],
             "--chunk-max-age",        str(s["chunk_max_age"]),
-            "--allow-other",
         ]
+
+        # Only pass --allow-other when the user has explicitly opted in.
+        # FUSE aborts with a fatal error when allow_other is requested but
+        # user_allow_other is absent from /etc/fuse3.conf, so this must
+        # never be the default for a desktop AppImage.
+        if s.get("allow_other", False):
+            cmd.append("--allow-other")
 
         try:
             with open(LOG_FILE, "a") as log_f:
@@ -252,6 +259,12 @@ class SettingsWindow(QWidget):
         self._start_on_launch = QCheckBox("Start mount automatically on launch")
         root.addWidget(self._start_on_launch)
 
+        self._allow_other = QCheckBox(
+            "Allow other users to access the mount  "
+            "(requires user_allow_other in /etc/fuse3.conf)"
+        )
+        root.addWidget(self._allow_other)
+
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("Cancel"); cancel_btn.clicked.connect(self.close)
@@ -277,6 +290,7 @@ class SettingsWindow(QWidget):
         self._lookahead.setValue(s.get("lookahead_chunks", 2))
         self._chunk_max_age.setValue(s.get("chunk_max_age", 3600))
         self._start_on_launch.setChecked(s.get("start_on_launch", True))
+        self._allow_other.setChecked(s.get("allow_other", False))
 
     def _browse_mountpoint(self):
         path = QFileDialog.getExistingDirectory(self, "Select mount folder",
@@ -297,6 +311,7 @@ class SettingsWindow(QWidget):
             "lookahead_chunks":     self._lookahead.value(),
             "chunk_max_age":        self._chunk_max_age.value(),
             "start_on_launch":      self._start_on_launch.isChecked(),
+            "allow_other":          self._allow_other.isChecked(),
         })
         save_settings(self._s)
         self.saved.emit(self._s)

@@ -1,0 +1,35 @@
+{
+  "name": "degoo-drive",
+  "productName": "Degoo Drive",
+  "version": "0.1.0",
+  "description": "Mount and sync your Degoo cloud storage",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --linux AppImage",
+    "build:deb": "electron-builder --linux deb",
+    "build:all": "electron-builder --linux AppImage deb"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.0"
+  },
+  "build": {
+    "appId": "com.degoo.drive",
+    "productName": "Degoo Drive",
+    "directories": { "output": "dist" },
+    "files": ["src/**/*", "assets/**/*"],
+    "extraResources": [{ "from": "fuse_degoo.py", "to": "fuse_degoo.py" }],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Network",
+      "icon": "assets/icon.png",
+      "synopsis": "Degoo cloud storage FUSE mount"
+    },
+    "appImage": { "artifactName": "degoo-drive-${version}-linux-x86_64.AppImage" },
+    "deb":      { "artifactName": "degoo-drive-${version}-linux-amd64.deb" }
+  }
+}

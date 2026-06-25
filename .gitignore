@@ -1,3 +1,3 @@
-/.idea/
-/degoo_drive.iml
-degoo/__pycache__/
+node_modules/
+dist/
+assets/icon.png

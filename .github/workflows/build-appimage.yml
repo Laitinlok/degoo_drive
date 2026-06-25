@@ -1,0 +1,71 @@
+name: Build AppImage
+
+on:
+  push:
+    branches: [feat/gui]
+    tags: ["v*"]
+  pull_request:
+    branches: [feat/gui]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            fuse3 libfuse3-dev libfuse3-3 \
+            pkg-config patchelf imagemagick \
+            libglib2.0-0 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
+            libxkbcommon-x11-0 libgl1 libegl1
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install python-appimage
+        run: pip install python-appimage
+
+      - name: Build AppImage
+        run: |
+          cp fuse_degoo.py appimage-recipe/
+
+          convert -size 256x256 xc:none \
+            -fill '#01696f' -draw 'circle 128,128 128,20' \
+            -fill white -font Liberation-Sans-Bold -pointsize 130 \
+            -gravity Center -draw 'text 0,0 "D"' \
+            appimage-recipe/degoo-drive.png
+
+          cp AppDir/usr/share/applications/degoo-drive.desktop appimage-recipe/
+
+          python -m python_appimage build app \
+            --linux-tag manylinux_2_28_x86_64 \
+            appimage-recipe
+
+          mv degoo-drive-gui*.AppImage degoo-drive-gui-linux-x86_64.AppImage
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: degoo-drive-gui-appimage
+          path: degoo-drive-gui-linux-x86_64.AppImage
+          retention-days: 30
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: degoo-drive-gui-linux-x86_64.AppImage
+          generate_release_notes: true

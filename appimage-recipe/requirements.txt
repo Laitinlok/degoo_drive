@@ -1,0 +1,6 @@
+PyQt6>=6.6.0
+git+https://github.com/marcomc/cligoo.git
+trio
+pyfuse3
+requests
+urllib3

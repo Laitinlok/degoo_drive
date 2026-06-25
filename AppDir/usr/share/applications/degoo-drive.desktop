@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Degoo Drive
+Comment=Mount and sync your Degoo cloud storage
+Exec=degoo-drive-gui
+Icon=degoo-drive
+Type=Application
+Categories=Network;FileManager;
+StartupNotify=false

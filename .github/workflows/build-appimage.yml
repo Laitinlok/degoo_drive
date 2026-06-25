@@ -116,7 +116,7 @@ jobs:
             "trio>=0.21.0"
 
           # cligoo: try PyPI first, fall back to git source.
-          pip3 install --target="$SITE" "cligoo>=1.0.0" || \
+          pip3 install --target="$SITE" "cligoo>=0.1.1" || \
           pip3 install --target="$SITE" \
             "git+https://github.com/Laitinlok/cligoo.git@main#egg=cligoo" || \
           pip3 install --target="$SITE" \

@@ -107,6 +107,10 @@ class TreeCache:
     Each entry is stored as a JSON blob keyed by the integer item ID.
     The database uses WAL journaling so concurrent readers never block writers.
 
+    A ``parent_id`` column is maintained alongside each row and indexed so
+    that :meth:`children_of` can retrieve all direct children in O(children)
+    time rather than scanning every row.
+
     The class exposes the minimal dict-like interface used throughout this
     module:  ``__getitem__``, ``__setitem__``, ``__delitem__``,
     ``__contains__``, ``__iter__``, ``items()``, ``values()``, ``get()``,

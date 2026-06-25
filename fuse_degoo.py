@@ -4,6 +4,9 @@
 Updated to use cligoo (https://github.com/marcomc/cligoo) as the Degoo API
 backend instead of the bundled degoo/__init__.py module.
 
+Directory tree is now persisted in a SQLite database so the FUSE mount
+starts instantly on subsequent runs without a full API rescan.
+
 Original degoo_drive: https://github.com/Laitinlok/degoo_drive
 cligoo API:           https://github.com/marcomc/cligoo
 """
@@ -12,9 +15,11 @@ import datetime
 import errno
 import faulthandler
 import glob
+import json
 import logging
 import mimetypes
 import os
+import sqlite3
 import stat as stat_m
 import sys
 import tempfile
@@ -50,8 +55,125 @@ faulthandler.enable()
 
 log = logging.getLogger(__name__)
 
-# Global tree cache: {int(item_id): item_dict}
-degoo_tree_content = {}
+# ---------------------------------------------------------------------------
+# SQLite-backed tree cache
+# ---------------------------------------------------------------------------
+
+_DEFAULT_DB_PATH = os.path.join(
+    os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')),
+    'degoo_drive',
+    'tree_cache.db',
+)
+
+
+class TreeCache:
+    """Thread-safe, SQLite-backed mapping that replaces the old `degoo_tree_content` dict.
+
+    Each entry is stored as a JSON blob keyed by the integer item ID.
+    The database uses WAL journaling so concurrent readers never block writers.
+
+    The class exposes the minimal dict-like interface used throughout this
+    module:  ``__getitem__``, ``__setitem__``, ``__delitem__``,
+    ``__contains__``, ``__iter__``, ``items()``, ``values()``, ``get()``,
+    ``keys()`` and ``clear()``.
+    """
+
+    def __init__(self, db_path: str = _DEFAULT_DB_PATH) -> None:
+        self._db_path = db_path
+        self._local = threading.local()  # per-thread connection
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        # Bootstrap the schema on the main thread
+        conn = self._conn()
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS items '
+            '(inode INTEGER PRIMARY KEY, payload TEXT NOT NULL)'
+        )
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.commit()
+
+    # ------------------------------------------------------------------
+    # Connection management (one sqlite3 connection per OS thread)
+    # ------------------------------------------------------------------
+
+    def _conn(self) -> sqlite3.Connection:
+        if not getattr(self._local, 'conn', None):
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')   # faster, still safe with WAL
+            self._local.conn = conn
+        return self._local.conn
+
+    # ------------------------------------------------------------------
+    # dict-like interface
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, inode: int) -> dict:
+        row = self._conn().execute(
+            'SELECT payload FROM items WHERE inode=?', (int(inode),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(inode)
+        return json.loads(row[0])
+
+    def __setitem__(self, inode: int, value: dict) -> None:
+        conn = self._conn()
+        conn.execute(
+            'INSERT OR REPLACE INTO items (inode, payload) VALUES (?, ?)',
+            (int(inode), json.dumps(value)),
+        )
+        conn.commit()
+
+    def __delitem__(self, inode: int) -> None:
+        conn = self._conn()
+        conn.execute('DELETE FROM items WHERE inode=?', (int(inode),))
+        conn.commit()
+
+    def __contains__(self, inode: object) -> bool:
+        row = self._conn().execute(
+            'SELECT 1 FROM items WHERE inode=?', (int(inode),)  # type: ignore[arg-type]
+        ).fetchone()
+        return row is not None
+
+    def __iter__(self):
+        for row in self._conn().execute('SELECT inode FROM items'):
+            yield row[0]
+
+    def get(self, inode: int, default=None):
+        try:
+            return self[inode]
+        except KeyError:
+            return default
+
+    def items(self):
+        for row in self._conn().execute('SELECT inode, payload FROM items'):
+            yield row[0], json.loads(row[1])
+
+    def values(self):
+        for row in self._conn().execute('SELECT payload FROM items'):
+            yield json.loads(row[0])
+
+    def keys(self):
+        for row in self._conn().execute('SELECT inode FROM items'):
+            yield row[0]
+
+    def clear(self) -> None:
+        conn = self._conn()
+        conn.execute('DELETE FROM items')
+        conn.commit()
+
+    def __len__(self) -> int:
+        row = self._conn().execute('SELECT COUNT(*) FROM items').fetchone()
+        return row[0] if row else 0
+
+
+# Global tree cache – initialised in main() once --db-path is known.
+tree_cache: TreeCache = None  # type: ignore[assignment]
+
+# ---------------------------------------------------------------------------
+# Legacy alias so all existing code referencing `degoo_tree_content` keeps
+# working without modification.  Reassigned in main() / load_degoo_content().
+# ---------------------------------------------------------------------------
+degoo_tree_content: TreeCache = None  # type: ignore[assignment]
 
 # Global cligoo client (initialised in main())
 _client: DegooClient = None  # type: ignore[assignment]
@@ -128,8 +250,6 @@ def _cligoo_item_to_tree(item: dict, parent_path: str) -> dict:
 
 def _build_tree_recursive(parent_id: int, parent_path: str, mode: str) -> None:
     """Populate degoo_tree_content by recursing through cligoo's list_dir."""
-    global degoo_tree_content
-
     items = _client.list_dir(str(parent_id), limit=None)
     for item in items:
         parent_entry = degoo_tree_content.get(parent_id)
@@ -478,21 +598,27 @@ class Operations(pyfuse3.Operations):
         if inode_p_old == inode_p_new:
             _client.rename(str(inode), name_new)
             if inode in degoo_tree_content:
-                old_fp = degoo_tree_content[inode]['FilePath']
+                entry = degoo_tree_content[inode]
+                old_fp = entry['FilePath']
                 new_fp = old_fp[:old_fp.rfind('/') + 1] + name_new
-                degoo_tree_content[inode]['Name'] = name_new
-                degoo_tree_content[inode]['FilePath'] = new_fp
+                entry['Name'] = name_new
+                entry['FilePath'] = new_fp
+                degoo_tree_content[inode] = entry  # write back to DB
         else:
             if name_old != name_new:
                 _client.rename(str(inode), name_new)
                 if inode in degoo_tree_content:
-                    degoo_tree_content[inode]['Name'] = name_new
+                    entry = degoo_tree_content[inode]
+                    entry['Name'] = name_new
+                    degoo_tree_content[inode] = entry
             _client.move([str(inode)], str(inode_p_new))
             if inode in degoo_tree_content:
+                entry = degoo_tree_content[inode]
                 new_parent_path = self._inode_to_path(inode_p_new, fullpath=True)
                 new_fp = new_parent_path.rstrip('/') + '/' + name_new
-                degoo_tree_content[inode]['FilePath'] = new_fp
-                degoo_tree_content[inode]['ParentID'] = inode_p_new
+                entry['FilePath'] = new_fp
+                entry['ParentID'] = inode_p_new
+                degoo_tree_content[inode] = entry
 
         path_new = self._inode_to_path(inode_p_new, fullpath=True) + '/' + name_new
 
@@ -811,7 +937,9 @@ class Operations(pyfuse3.Operations):
                 item = _client.get_item(str(item_id))
                 url = item.get('URL') or item.get('OptimizedURL') or item.get('ThumbnailURL')
                 if item_id in degoo_tree_content:
-                    degoo_tree_content[item_id]['URL'] = url
+                    entry = degoo_tree_content[item_id]
+                    entry['URL'] = url
+                    degoo_tree_content[item_id] = entry  # write back to DB
             except DegooAPIError as e:
                 log.debug('Error getting info for file [%s]: %s', degoo_path_file, str(e))
 
@@ -1011,7 +1139,9 @@ class Operations(pyfuse3.Operations):
     def load_degoo_content(self):
         threadLock.acquire()
 
-        global degoo_tree_content
+        # Clear the DB so stale entries from deleted/moved files are removed
+        # before we repopulate from the live API.
+        degoo_tree_content.clear()
 
         root_item = _client.resolve_path(self._source)
         if root_item is None:
@@ -1031,7 +1161,7 @@ class Operations(pyfuse3.Operations):
             'URL': None,
             'Category': root_item.get('Category', 2),
         }
-        degoo_tree_content = {root_id: root_entry}
+        degoo_tree_content[root_id] = root_entry
 
         _build_tree_recursive(root_id, self._source, self._mode)
 
@@ -1120,6 +1250,13 @@ def parse_args(args):
                             '(default: 2). Higher values reduce stalls on sequential reads at '
                             'the cost of extra memory and temp-disk usage.'
                         ))
+    parser.add_argument('--db-path', type=str, default=_DEFAULT_DB_PATH,
+                        help=(
+                            'Path to the SQLite database used to persist the Degoo directory '
+                            'tree between mounts (default: %(default)s). '
+                            'Set to a tmpfs path for a volatile in-process cache, or to a '
+                            'shared volume path in Docker/Kubernetes deployments.'
+                        ))
 
     return parser.parse_args(args)
 
@@ -1147,6 +1284,7 @@ def main():
     download_threads = options.download_threads
     subchunk_connections = options.subchunk_connections
     lookahead_chunks = options.lookahead_chunks
+    db_path = options.db_path
 
     log.debug('##### Initializing Degoo drive (cligoo backend) #####')
     log.debug('Local mount point:      %s', options.mountpoint)
@@ -1154,6 +1292,7 @@ def main():
     log.debug('Download threads:       %d', download_threads)
     log.debug('Sub-chunk connections:  %d', subchunk_connections)
     log.debug('Lookahead chunks:       %d', lookahead_chunks)
+    log.debug('Tree cache DB:          %s', db_path)
     if degoo_email and degoo_pass:
         log.debug('Degoo email:            %s', degoo_email)
         log.debug('Degoo pass:             %s', '*' * len(degoo_pass))
@@ -1178,6 +1317,17 @@ def main():
         _cfg_mod.CONFIG_DIR = _Path(config_path)
         _cfg_mod.TOML_FILE = _cfg_mod.CONFIG_DIR / 'config.toml'
         _cfg_mod.CONFIG_FILE = _cfg_mod.CONFIG_DIR / 'config.json'
+
+    # ---------------------------------------------------------------------------
+    # Initialise the SQLite-backed tree cache
+    # ---------------------------------------------------------------------------
+    global tree_cache, degoo_tree_content
+    tree_cache = TreeCache(db_path)
+    degoo_tree_content = tree_cache
+    log.debug(
+        'Tree cache opened: %s  (%d entries already cached)',
+        db_path, len(tree_cache)
+    )
 
     # Build the shared HTTP session (large connection pool for parallel sub-ranges)
     global _http_session

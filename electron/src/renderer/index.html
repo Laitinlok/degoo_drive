@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"/>
+  <title>Degoo Drive</title>
+  <style>
+    :root {
+      --bg:#0e1117; --surface:#181c27; --surface2:#1f253a;
+      --border:#2a3050; --text:#dde1f0; --muted:#6b7499;
+      --teal:#01696f; --teal-h:#0c4e54; --teal-dim:#0a2f31;
+      --red:#e05c6c; --r:8px;
+      --font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:var(--font);font-size:14px;background:var(--bg);color:var(--text);height:100vh;overflow-y:auto}
+    .app{padding:24px;max-width:520px;margin:0 auto}
+    .header{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+    .logo{width:40px;height:40px;border-radius:50%;background:var(--teal);
+          display:flex;align-items:center;justify-content:center;
+          font-size:20px;font-weight:800;color:#fff;flex-shrink:0}
+    .header h1{font-size:18px;font-weight:700}
+    .header .sub{font-size:12px;color:var(--muted)}
+    .tabs{display:flex;gap:4px;background:var(--surface);
+          border:1px solid var(--border);border-radius:var(--r);
+          padding:4px;margin-bottom:20px}
+    .tab{flex:1;padding:8px;text-align:center;border-radius:6px;
+         cursor:pointer;font-size:13px;font-weight:600;color:var(--muted);
+         transition:background .15s,color .15s}
+    .tab.active{background:var(--teal);color:#fff}
+    .status-strip{display:flex;gap:8px;margin-bottom:16px}
+    .badge{padding:4px 10px;border-radius:99px;font-size:12px;font-weight:600;
+           background:#2a3050;color:var(--muted);transition:all .2s}
+    .badge.running{background:var(--teal-dim);color:#4fd1c5}
+    .badge.error  {background:#2f1a1d;color:var(--red)}
+    .section{background:var(--surface);border:1px solid var(--border);
+             border-radius:var(--r);padding:16px;margin-bottom:14px}
+    .stitle{font-size:11px;font-weight:700;letter-spacing:.08em;
+            text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+    .field{margin-bottom:12px}.field:last-child{margin-bottom:0}
+    label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+    .irow{display:flex;gap:8px}
+    input[type=text],input[type=email],input[type=password],input[type=number]{
+      width:100%;padding:8px 10px;background:var(--surface2);
+      border:1px solid var(--border);border-radius:6px;color:var(--text);
+      font-size:14px;outline:none;transition:border-color .15s}
+    input:focus{border-color:var(--teal)}
+    input[type=number]{width:110px}
+    .trow{display:flex;align-items:center;gap:10px;cursor:pointer}
+    .tog{position:relative;width:40px;height:22px;background:var(--border);
+         border-radius:11px;transition:background .2s;flex-shrink:0}
+    .tog.on{background:var(--teal)}
+    .tog::after{content:'';position:absolute;top:3px;left:3px;width:16px;height:16px;
+                background:#fff;border-radius:50%;transition:transform .2s}
+    .tog.on::after{transform:translateX(18px)}
+    .arow{display:flex;gap:10px;margin-bottom:14px}
+    .btn{padding:9px 20px;border-radius:6px;font-size:13px;font-weight:600;
+         cursor:pointer;border:none;transition:background .15s}
+    .btn-start{background:var(--teal);color:#fff}.btn-start:hover{background:var(--teal-h)}
+    .btn-stop{background:var(--surface2);color:var(--red);border:1px solid var(--border)}
+    .btn-stop:hover{background:#2f1a1d}
+    .btn-sec{background:var(--surface2);color:var(--muted);border:1px solid var(--border)}
+    .btn-sec:hover{background:var(--border)}
+    .btn-pri{background:var(--teal);color:#fff}.btn-pri:hover{background:var(--teal-h)}
+    .btn-br{padding:8px 12px;background:var(--surface2);border:1px solid var(--border);
+            border-radius:6px;color:var(--muted);font-size:13px;cursor:pointer;white-space:nowrap}
+    .btn-br:hover{color:var(--text);background:var(--border)}
+    .brow{display:flex;gap:10px;justify-content:flex-end;margin-top:4px}
+    .activity{background:var(--surface);border:1px solid var(--border);
+              border-radius:var(--r);padding:12px;margin-bottom:14px;
+              max-height:150px;overflow-y:auto}
+    .atitle{font-size:11px;font-weight:700;letter-spacing:.08em;
+            text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+    .alist{list-style:none;font-size:12px;color:var(--muted)}
+    .alist li{padding:2px 0;border-bottom:1px solid var(--border)}
+    .alist li:last-child{border:none}
+    .ku{color:#4fd1c5}.kd{color:#a78bfa}.kc,.ke{color:var(--red)}
+    .saved{text-align:center;color:#4fd1c5;font-size:13px;margin-top:8px;
+           opacity:0;transition:opacity .3s}
+    .saved.show{opacity:1}
+    .panel{display:none}.panel.active{display:block}
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <div class="logo">D</div>
+    <div><h1>Degoo Drive</h1><div class="sub">Mount &amp; Sync your Degoo cloud storage</div></div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-tab="mount">💾 Mount</div>
+    <div class="tab"        data-tab="sync" >⇄ Sync</div>
+    <div class="tab"        data-tab="settings">⚙ Settings</div>
+  </div>
+  <div class="status-strip">
+    <span class="badge" id="mountBadge">Mount: Stopped</span>
+    <span class="badge" id="syncBadge" >Sync: Stopped</span>
+  </div>
+
+  <!-- Mount panel -->
+  <div class="panel active" id="panel-mount">
+    <div class="arow">
+      <button class="btn btn-start" id="mountStartBtn">▶ Start Mount</button>
+      <button class="btn btn-stop"  id="mountStopBtn" >■ Stop</button>
+    </div>
+    <div class="section">
+      <div class="stitle">Mount Configuration</div>
+      <div class="field"><label>Local mount folder</label>
+        <div class="irow"><input type="text" id="mountpoint" placeholder="/home/user/Degoo"/>
+        <button class="btn-br" data-browse="mountpoint">Browse…</button></div></div>
+      <div class="field"><label>Degoo cloud path</label>
+        <input type="text" id="degooPath" placeholder="/"/></div>
+      <div class="field"><div class="trow" id="mountToggleRow">
+        <div class="tog" id="mountToggle"></div>
+        <span style="font-size:13px">Enable mount on launch</span></div></div>
+    </div>
+  </div>
+
+  <!-- Sync panel -->
+  <div class="panel" id="panel-sync">
+    <div class="arow">
+      <button class="btn btn-start" id="syncStartBtn">⇄ Start Sync</button>
+      <button class="btn btn-stop"  id="syncStopBtn" >■ Stop</button>
+    </div>
+    <div class="section">
+      <div class="stitle">Sync Configuration</div>
+      <div class="field"><label>Local sync folder</label>
+        <div class="irow"><input type="text" id="syncDir" placeholder="/home/user/Degoo-Sync"/>
+        <button class="btn-br" data-browse="syncDir">Browse…</button></div></div>
+      <div class="field"><label>Poll interval (seconds)</label>
+        <input type="number" id="pollSecs" min="10" max="3600"/></div>
+      <div class="field"><div class="trow" id="syncToggleRow">
+        <div class="tog" id="syncToggle"></div>
+        <span style="font-size:13px">Enable sync on launch</span></div></div>
+    </div>
+    <div class="activity">
+      <div class="atitle">Activity</div>
+      <ul class="alist" id="activityList"><li style="color:var(--muted)">No activity yet</li></ul>
+    </div>
+  </div>
+
+  <!-- Settings panel -->
+  <div class="panel" id="panel-settings">
+    <div class="section">
+      <div class="stitle">Account</div>
+      <div class="field"><label>Email</label>
+        <input type="email" id="email" placeholder="your@email.com"/></div>
+      <div class="field"><label>Password</label>
+        <input type="password" id="password" placeholder="••••••••"/></div>
+    </div>
+    <div class="section">
+      <div class="stitle">Performance</div>
+      <div class="field"><label>Cache size (MB)</label>
+        <input type="number" id="cacheSizeMb" min="32" max="2048"/></div>
+      <div class="field"><label>Refresh interval (min)</label>
+        <input type="number" id="refreshIntervalMin" min="1" max="1440"/></div>
+      <div class="field"><label>Download threads</label>
+        <input type="number" id="downloadThreads" min="1" max="32"/></div>
+      <div class="field"><label>Sub-chunk connections</label>
+        <input type="number" id="subchunkConnections" min="1" max="32"/></div>
+      <div class="field"><label>Lookahead chunks</label>
+        <input type="number" id="lookaheadChunks" min="1" max="16"/></div>
+      <div class="field"><label>Chunk max age (sec)</label>
+        <input type="number" id="chunkMaxAge" min="0" max="86400"/></div>
+    </div>
+    <div class="brow">
+      <button class="btn btn-sec" id="cancelBtn">Cancel</button>
+      <button class="btn btn-pri" id="saveBtn">Save Settings</button>
+    </div>
+    <div class="saved" id="savedMsg">✓ Settings saved</div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,42 +1,65 @@
-# Degoo Drive GUI
+# Degoo Drive — Desktop App
 
-A Linux system-tray application that runs `fuse_degoo.py` in the background
-and exposes start / stop / settings through a tray icon.
+Electron tray app for Linux providing **FUSE mount** and **two-way sync**
+for Degoo cloud storage — inspired by
+[Internxt Drive Linux](https://github.com/internxt/drive-desktop-linux).
+
+## Architecture
+
+```
+┌─ Electron (GUI) ───────────────────────────────────────────┐
+│  Tray → Mount tab  /  Sync tab  /  Settings             │
+│  Main process spawns Python IPC bridge (stdio JSON)    │
+└──────────────────┬───────────────────────────┘
+                   │
+        ┌─────────┴──────────────────┐
+        │  python/degoo_sync/           │
+        │  ipc_bridge.py               │  ← JSON stdin/stdout
+        │    ├── SyncEngine            │  ← watchdog + poller
+        │    │     └── SyncStateDB    │  ← sync_state.db
+        │    └── DegooAPIAdapter       │  ← wraps fuse_degoo.py
+        └──────────────────────────────┘
+                   │
+        ┌─────────┴──────────────────┐
+        │  fuse_degoo.py (backend)      │
+        │    └── TreeCache             │  ← tree_cache.db
+        └──────────────────────────────┘
+```
 
 ## Features
 
-- **System tray icon** — green when mounted, grey when stopped, magenta on error
-- **Settings window** — credentials, mount folder, performance tuning
-- **Auto-start** — optionally starts the mount on launch
-- **Log viewer** — opens the log file in your default text editor
-- **AppImage distribution** — single executable, no install needed
+| Feature | Detail |
+|---|---|
+| **FUSE mount** | Browse Degoo as a virtual local filesystem |
+| **Two-way sync** | Upload local changes, download remote changes |
+| **Conflict handling** | Last-write-wins; `.conflict` copy preserved |
+| **SQLite sync state** | `sync_state.db` persists across restarts |
+| **SQLite tree cache** | `tree_cache.db` persists FUSE tree across mounts |
+| **Live activity log** | Per-file sync events in the Sync tab |
+| **Teal tray icon** | Green=running, grey=stopped, purple=error |
+| **Tabbed UI** | Mount / Sync / Settings in one window |
 
-## Quick start (from AppImage)
+## Install (AppImage)
 
 ```bash
-chmod +x degoo-drive-gui-linux-x86_64.AppImage
-./degoo-drive-gui-linux-x86_64.AppImage
+chmod +x degoo-drive-*.AppImage
+./degoo-drive-*.AppImage
 ```
 
-Right-click the tray icon → **Settings** → enter your Degoo email/password
-and choose a local folder → **Save** → the mount starts automatically.
+Right-click tray → **Settings** → enter Degoo credentials → **Save**.
 
 ## Build locally
 
 ```bash
-pip install python-appimage PyQt6
-python -m python_appimage build app appimage-recipe/
+pip install watchdog          # for local file watching
+cd electron && npm install
+npm run build:all             # dist/*.AppImage + dist/*.deb
 ```
 
-## Branch layout
+## Python dependencies
 
-| Branch | Purpose |
-|---|---|
-| `feat/cligoo-backend` | FUSE backend + SQLite cache |
-| `feat/gui` | This GUI layer (depends on the backend branch) |
+```
+watchdog
+```
 
-## Requirements
-
-- Linux x86_64
-- FUSE3 (`fuse3` package on Debian/Fedora)
-- `--allow-other` requires `/etc/fuse.conf` → `user_allow_other`
+Add to `requirements.txt` in the backend branch.

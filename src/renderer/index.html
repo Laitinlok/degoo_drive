@@ -5,82 +5,379 @@
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"/>
-  <title>Degoo Drive — Settings</title>
+  <title>Degoo Drive</title>
   <style>
-    :root{--bg:#0f1117;--sf:#1a1d27;--sf2:#21263a;--bd:#2d3250;--tx:#e2e4ef;--mu:#7b80a0;--pr:#01696f;--prh:#0c4e54;--er:#e05c6c;--r:8px;--f:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:var(--f);font-size:14px;background:var(--bg);color:var(--tx);height:100vh;overflow-y:auto}
-    .app{padding:24px;max-width:480px;margin:0 auto}
-    .header{display:flex;align-items:center;gap:12px;margin-bottom:24px}
-    .logo{width:40px;height:40px;border-radius:50%;background:var(--pr);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:800;color:#fff}
-    .header h1{font-size:20px;font-weight:700}
-    .badge{margin-left:auto;padding:4px 10px;border-radius:99px;font-size:12px;font-weight:600;background:#2d3250;color:var(--mu);transition:all .2s}
-    .badge.running{background:#0a2f31;color:#4fd1c5}
-    .badge.error{background:#2f1a1d;color:var(--er)}
-    .section{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:16px;margin-bottom:16px}
-    .stitle{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin-bottom:14px}
-    .field{margin-bottom:12px}.field:last-child{margin-bottom:0}
-    label{display:block;font-size:13px;color:var(--mu);margin-bottom:5px}
-    .row{display:flex;gap:8px}
-    input[type=text],input[type=email],input[type=password],input[type=number]{width:100%;padding:8px 10px;background:var(--sf2);border:1px solid var(--bd);border-radius:6px;color:var(--tx);font-size:14px;outline:none;transition:border-color .15s}
-    input:focus{border-color:var(--pr)}
-    input[type=number]{width:100px}
-    .tog-row{display:flex;align-items:center;gap:10px;cursor:pointer}
-    .tog{position:relative;width:40px;height:22px;background:var(--bd);border-radius:11px;transition:background .2s;flex-shrink:0}
-    .tog.on{background:var(--pr)}.tog::after{content:'';position:absolute;top:3px;left:3px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .2s}
-    .tog.on::after{transform:translateX(18px)}
-    .btns{display:flex;gap:10px;justify-content:flex-end;margin-top:8px}
-    button{padding:9px 22px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:background .15s}
-    .sec{background:var(--sf2);color:var(--mu);border:1px solid var(--bd)}.sec:hover{background:var(--bd)}
-    .pri{background:var(--pr);color:#fff}.pri:hover{background:var(--prh)}
-    .brw{padding:8px 12px;background:var(--sf2);border:1px solid var(--bd);border-radius:6px;color:var(--mu);font-size:13px;cursor:pointer;white-space:nowrap}.brw:hover{background:var(--bd);color:var(--tx)}
-    .ok{text-align:center;color:#4fd1c5;font-size:13px;margin-top:8px;opacity:0;transition:opacity .3s}.ok.show{opacity:1}
+    :root {
+      --bg:   #1c1c1e;
+      --sf:   #2c2c2e;
+      --sf2:  #3a3a3c;
+      --bd:   #48484a;
+      --tx:   #f2f2f7;
+      --mu:   #8e8e93;
+      --pr:   #01a99c;
+      --prh:  #01877c;
+      --er:   #ff453a;
+      --warn: #ffd60a;
+      --r:    14px;
+      --f:    -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: var(--f);
+      font-size: 14px;
+      background: var(--bg);
+      color: var(--tx);
+      user-select: none;
+      -webkit-app-region: drag;
+    }
+    button, input, a { -webkit-app-region: no-drag; }
+
+    /* ── Main panel ─────────────────────────────────── */
+    #main {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      width: 100%;
+    }
+
+    /* ── Top bar ─────────────────────────────────────── */
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.07);
+    }
+    .avatar {
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #6e6dcd, #9b59b6);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700; color: #fff;
+      flex-shrink: 0;
+    }
+    .account-info { flex: 1; min-width: 0; }
+    .account-email {
+      font-size: 13px; font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      color: var(--tx);
+    }
+    .storage-bar-wrap { margin-top: 4px; }
+    .storage-track {
+      height: 4px; background: var(--sf2);
+      border-radius: 2px; overflow: hidden;
+    }
+    .storage-fill {
+      height: 100%; background: var(--pr);
+      border-radius: 2px; transition: width .4s;
+    }
+    .storage-label {
+      font-size: 11px; color: var(--mu);
+      margin-top: 3px;
+    }
+    .topbar-icons {
+      display: flex; gap: 2px; flex-shrink: 0;
+    }
+    .icon-btn {
+      width: 30px; height: 30px;
+      border-radius: 8px;
+      background: none; border: none;
+      color: var(--mu);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: background .15s, color .15s;
+    }
+    .icon-btn:hover { background: var(--sf2); color: var(--tx); }
+    .icon-btn svg { pointer-events: none; }
+
+    /* ── Status centre ───────────────────────────────── */
+    .status-centre {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0;
+      padding: 0 24px;
+    }
+    .status-icon-wrap {
+      width: 96px; height: 96px;
+      border-radius: 24px;
+      background: var(--sf);
+      display: flex; align-items: center; justify-content: center;
+      margin-bottom: 20px;
+      transition: background .3s;
+    }
+    .status-icon-wrap.running { background: #0a2f31; }
+    .status-icon-wrap.error   { background: #2f1a1a; }
+    .status-svg { transition: opacity .2s; }
+
+    /* spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin-ring {
+      animation: spin 1s linear infinite;
+      transform-origin: 24px 24px;
+    }
+
+    .status-title {
+      font-size: 15px; font-weight: 600;
+      color: var(--tx); text-align: center;
+      margin-bottom: 5px;
+    }
+    .status-sub {
+      font-size: 13px; color: var(--mu);
+      text-align: center; max-width: 220px;
+      line-height: 1.5;
+    }
+
+    /* ── Bottom pill ─────────────────────────────────── */
+    .bottom-bar {
+      padding: 12px 16px 14px;
+      border-top: 1px solid rgba(255,255,255,.07);
+    }
+    .sync-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--tx);
+    }
+    .pill-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--mu);
+      flex-shrink: 0;
+      transition: background .3s;
+    }
+    .pill-dot.running { background: var(--pr); }
+    .pill-dot.error   { background: var(--er); }
+
+    /* ── Settings panel (slide-in) ───────────────────── */
+    #settings {
+      position: fixed; inset: 0;
+      background: var(--bg);
+      transform: translateX(100%);
+      transition: transform .25s cubic-bezier(.4,0,.2,1);
+      display: flex; flex-direction: column;
+      z-index: 10;
+      overflow-y: auto;
+    }
+    #settings.open { transform: translateX(0); }
+    .settings-header {
+      display: flex; align-items: center; gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.07);
+      flex-shrink: 0;
+    }
+    .back-btn {
+      width: 30px; height: 30px; border-radius: 8px;
+      background: none; border: none; color: var(--mu);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: background .15s, color .15s;
+    }
+    .back-btn:hover { background: var(--sf2); color: var(--tx); }
+    .settings-header h2 { font-size: 15px; font-weight: 600; }
+    .settings-body { padding: 16px; flex: 1; }
+    .section {
+      background: var(--sf);
+      border-radius: var(--r);
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .stitle {
+      font-size: 11px; font-weight: 700;
+      letter-spacing: .08em; text-transform: uppercase;
+      color: var(--mu); margin-bottom: 12px;
+    }
+    .field { margin-bottom: 10px; }
+    .field:last-child { margin-bottom: 0; }
+    label { display: block; font-size: 12px; color: var(--mu); margin-bottom: 4px; }
+    .row { display: flex; gap: 8px; }
+    input[type=text], input[type=email], input[type=password], input[type=number] {
+      width: 100%; padding: 8px 10px;
+      background: var(--sf2); border: 1px solid var(--bd);
+      border-radius: 8px; color: var(--tx); font-size: 13px;
+      outline: none; transition: border-color .15s;
+    }
+    input:focus { border-color: var(--pr); }
+    input[type=number] { width: 90px; }
+    .tog-row { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+    .tog {
+      position: relative; width: 40px; height: 22px;
+      background: var(--bd); border-radius: 11px;
+      transition: background .2s; flex-shrink: 0;
+    }
+    .tog.on { background: var(--pr); }
+    .tog::after {
+      content: ''; position: absolute;
+      top: 3px; left: 3px; width: 16px; height: 16px;
+      background: #fff; border-radius: 50%; transition: transform .2s;
+    }
+    .tog.on::after { transform: translateX(18px); }
+    .btns {
+      display: flex; gap: 10px; justify-content: flex-end;
+      padding: 0 16px 20px;
+      flex-shrink: 0;
+    }
+    .brw {
+      padding: 8px 12px;
+      background: var(--sf2); border: 1px solid var(--bd);
+      border-radius: 8px; color: var(--mu); font-size: 13px;
+      cursor: pointer; white-space: nowrap;
+    }
+    .brw:hover { background: var(--bd); color: var(--tx); }
+    .btn-save {
+      padding: 9px 22px; border-radius: 8px;
+      font-size: 14px; font-weight: 600;
+      cursor: pointer; border: none;
+      background: var(--pr); color: #fff;
+      transition: background .15s;
+    }
+    .btn-save:hover { background: var(--prh); }
+    .btn-cancel {
+      padding: 9px 22px; border-radius: 8px;
+      font-size: 14px; font-weight: 600;
+      cursor: pointer;
+      background: var(--sf2); color: var(--mu);
+      border: 1px solid var(--bd);
+      transition: background .15s;
+    }
+    .btn-cancel:hover { background: var(--bd); color: var(--tx); }
+    .ok {
+      text-align: center; color: var(--pr);
+      font-size: 13px; padding: 0 16px 12px;
+      opacity: 0; transition: opacity .3s; flex-shrink: 0;
+    }
+    .ok.show { opacity: 1; }
   </style>
 </head>
 <body>
-<div class="app">
-  <div class="header">
-    <div class="logo">D</div>
-    <h1>Degoo Drive</h1>
-    <span class="badge" id="badge">Stopped</span>
-  </div>
-  <div class="section">
-    <div class="stitle">Account</div>
-    <div class="field"><label>Email</label><input type="email" id="email" placeholder="your@email.com"/></div>
-    <div class="field"><label>Password</label><input type="password" id="password" placeholder="••••••••"/></div>
-  </div>
-  <div class="section">
-    <div class="stitle">Mount</div>
-    <div class="field">
-      <label>Local folder</label>
-      <div class="row"><input type="text" id="mountpoint"/><button class="brw" id="browseBtn">Browse…</button></div>
+
+<!-- ── Main sync panel ─────────────────────────────── -->
+<div id="main">
+  <div class="topbar">
+    <div class="avatar" id="avatar">AD</div>
+    <div class="account-info">
+      <div class="account-email" id="accountEmail">—</div>
+      <div class="storage-bar-wrap">
+        <div class="storage-track"><div class="storage-fill" id="storageFill" style="width:0%"></div></div>
+        <div class="storage-label" id="storageLabel">— of — GB</div>
+      </div>
     </div>
-    <div class="field"><label>Degoo path</label><input type="text" id="degooPath" placeholder="/"/></div>
+    <div class="topbar-icons">
+      <!-- Globe -->
+      <button class="icon-btn" title="Open Degoo web" id="webBtn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+        </svg>
+      </button>
+      <!-- Folder -->
+      <button class="icon-btn" title="Open mount folder" id="folderBtn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+        </svg>
+      </button>
+      <!-- Gear -->
+      <button class="icon-btn" title="Settings" id="gearBtn">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
   </div>
-  <div class="section">
-    <div class="stitle">Performance</div>
-    <div class="field"><label>Cache size (MB)</label><input type="number" id="cacheSizeMb" min="32" max="2048"/></div>
-    <div class="field"><label>Refresh interval (min)</label><input type="number" id="refreshIntervalMin" min="1" max="1440"/></div>
-    <div class="field"><label>Download threads</label><input type="number" id="downloadThreads" min="1" max="32"/></div>
-    <div class="field"><label>Sub-chunk connections</label><input type="number" id="subchunkConnections" min="1" max="32"/></div>
-    <div class="field"><label>Lookahead chunks</label><input type="number" id="lookaheadChunks" min="1" max="16"/></div>
-    <div class="field"><label>Chunk max age (sec)</label><input type="number" id="chunkMaxAge" min="0" max="86400"/></div>
+
+  <div class="status-centre">
+    <div class="status-icon-wrap" id="iconWrap">
+      <!-- checkmark (stopped/synced) -->
+      <svg id="iconCheck" class="status-svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+        <polyline points="12,26 20,34 36,16" stroke="#8e8e93" stroke-width="4"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <!-- spinner (running) -->
+      <svg id="iconSpin" class="status-svg" width="48" height="48" viewBox="0 0 48 48"
+           fill="none" style="display:none">
+        <circle cx="24" cy="24" r="18" stroke="#0a3f42" stroke-width="4"/>
+        <path class="spin-ring" d="M24 6 a18 18 0 0 1 18 18"
+              stroke="var(--pr)" stroke-width="4" stroke-linecap="round"/>
+      </svg>
+      <!-- error -->
+      <svg id="iconErr" class="status-svg" width="48" height="48" viewBox="0 0 48 48"
+           fill="none" style="display:none">
+        <line x1="24" y1="14" x2="24" y2="28" stroke="var(--er)" stroke-width="4" stroke-linecap="round"/>
+        <circle cx="24" cy="35" r="2.5" fill="var(--er)"/>
+      </svg>
+    </div>
+    <div class="status-title" id="statusTitle">Your files are up to date</div>
+    <div class="status-sub"  id="statusSub">Sync activity will show up here</div>
   </div>
-  <div class="section">
-    <div class="stitle">Options</div>
-    <div class="field">
-      <div class="tog-row" id="togRow">
-        <div class="tog" id="tog"></div>
-        <span>Start mount automatically on launch</span>
+
+  <div class="bottom-bar">
+    <div class="sync-pill">
+      <div class="pill-dot" id="pillDot"></div>
+      <span id="pillText">Stopped</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Settings panel ────────────────────────────────── -->
+<div id="settings">
+  <div class="settings-header">
+    <button class="back-btn" id="backBtn">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="15 18 9 12 15 6"/>
+      </svg>
+    </button>
+    <h2>Settings</h2>
+  </div>
+  <div class="settings-body">
+    <div class="section">
+      <div class="stitle">Account</div>
+      <div class="field"><label>Email</label><input type="email" id="email" placeholder="your@email.com"/></div>
+      <div class="field"><label>Password</label><input type="password" id="password" placeholder="••••••••"/></div>
+    </div>
+    <div class="section">
+      <div class="stitle">Mount</div>
+      <div class="field">
+        <label>Local folder</label>
+        <div class="row"><input type="text" id="mountpoint"/><button class="brw" id="browseBtn">Browse…</button></div>
+      </div>
+      <div class="field"><label>Degoo path</label><input type="text" id="degooPath" placeholder="/"/></div>
+    </div>
+    <div class="section">
+      <div class="stitle">Performance</div>
+      <div class="field"><label>Cache size (MB)</label><input type="number" id="cacheSizeMb" min="32" max="2048"/></div>
+      <div class="field"><label>Refresh interval (min)</label><input type="number" id="refreshIntervalMin" min="1" max="1440"/></div>
+      <div class="field"><label>Download threads</label><input type="number" id="downloadThreads" min="1" max="32"/></div>
+      <div class="field"><label>Sub-chunk connections</label><input type="number" id="subchunkConnections" min="1" max="32"/></div>
+      <div class="field"><label>Lookahead chunks</label><input type="number" id="lookaheadChunks" min="1" max="16"/></div>
+      <div class="field"><label>Chunk max age (sec)</label><input type="number" id="chunkMaxAge" min="0" max="86400"/></div>
+    </div>
+    <div class="section">
+      <div class="stitle">Advanced</div>
+      <div class="field"><label>DB path</label><input type="text" id="dbPath"/></div>
+      <div class="field"><label>Chunk cache dir</label><input type="text" id="chunkCacheDir"/></div>
+    </div>
+    <div class="section">
+      <div class="stitle">Options</div>
+      <div class="field">
+        <div class="tog-row" id="togRow">
+          <div class="tog" id="tog"></div>
+          <span>Start mount automatically on launch</span>
+        </div>
       </div>
     </div>
   </div>
   <div class="btns">
-    <button class="sec" id="cancelBtn">Cancel</button>
-    <button class="pri" id="saveBtn">Save</button>
+    <button class="btn-cancel" id="cancelBtn">Cancel</button>
+    <button class="btn-save" id="saveBtn">Save</button>
   </div>
   <div class="ok" id="ok">✓ Settings saved</div>
 </div>
+
 <script src="app.js"></script>
 </body>
 </html>

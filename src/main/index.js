@@ -18,6 +18,7 @@ const store = new Store({
     startOnLaunch: true,
     dbPath: path.join(app.getPath('home'), '.cache', 'degoo_drive', 'tree_cache.db'),
     chunkCacheDir: path.join(app.getPath('home'), '.cache', 'degoo_drive', 'chunks'),
+    storageUsedGb: 0, storageTotalGb: 2048,
   }
 });
 
@@ -27,6 +28,21 @@ const LOG_FILE = path.join(app.getPath('userData'), 'degoo-drive.log');
 // ── Resolve bundled Python runtime ──────────────────────────────────────────
 const RESOURCES = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..', '..');
 const PYTHON_DIR = path.join(RESOURCES, 'python');
+
+// Detect bundled Python version from directory name (python/lib/pythonX.Y)
+// without needing to execute Python first.
+function detectBundledPyVer() {
+  const libDir = path.join(PYTHON_DIR, 'lib');
+  if (!fs.existsSync(libDir)) return null;
+  const entries = fs.readdirSync(libDir);
+  for (const e of entries) {
+    const m = e.match(/^python(\d+\.\d+)$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+const BUNDLED_PYVER = detectBundledPyVer();
 const PYTHON_BIN = (() => {
   const bundled = path.join(PYTHON_DIR, 'bin', 'python3');
   if (fs.existsSync(bundled)) return bundled;
@@ -38,31 +54,51 @@ const SCRIPT = (() => {
   return path.join(__dirname, '..', '..', 'fuse_degoo.py');
 })();
 
-// ── Site-packages path (matches pip --target layout) ────────────────────────
+// ── Build Python environment ──────────────────────────────────────────────
+//
+// CPython looks for stdlib + lib-dynload relative to PYTHONHOME:
+//   $PYTHONHOME/lib/pythonX.Y/           <- pure-Python stdlib
+//   $PYTHONHOME/lib/pythonX.Y/lib-dynload/ <- C extensions (_sqlite3, etc.)
+//
+// Our bundle layout (under resources/python/) mirrors this exactly:
+//   python/
+//     bin/python3
+//     lib/
+//       pythonX.Y/
+//         site-packages/   <- pip --target output (pyfuse3, trio, requests …)
+//         lib-dynload/     <- _sqlite3.so, _ssl.so, _hashlib.so …
+//     stdlib/              <- copy of /usr/lib/pythonX.Y (pure-Python stdlib)
+//     lib/                 <- libfuse3.so.3, libpython3.X.so, libssl.so …
+//
+// We set:
+//   PYTHONHOME  = PYTHON_DIR          so CPython finds stdlib + lib-dynload
+//   PYTHONPATH  = site-packages        so 'import pyfuse3' etc. work
+//   LD_LIBRARY_PATH = python/lib       so dlopen finds libfuse3 + libpython
+//
 function getPythonEnv() {
-  const sitePackages = (() => {
-    // Find python version from bundled python
-    try {
-      const ver = cp.execSync(`"${PYTHON_BIN}" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"`,
-        { encoding: 'utf8' }).trim();
-      return path.join(PYTHON_DIR, 'lib', `python${ver}`, 'site-packages');
-    } catch { return ''; }
-  })();
-
   const env = { ...process.env };
-  if (sitePackages) {
-    env.PYTHONPATH = sitePackages + (process.env.PYTHONPATH ? ':' + process.env.PYTHONPATH : '');
+
+  if (BUNDLED_PYVER) {
+    const libBase     = path.join(PYTHON_DIR, 'lib', `python${BUNDLED_PYVER}`);
+    const sitePkgs    = path.join(libBase, 'site-packages');
+    const stdlib      = path.join(PYTHON_DIR, 'stdlib');
+    const sharedLibs  = path.join(PYTHON_DIR, 'lib');
+
+    // PYTHONHOME tells CPython where to find its standard library.
+    // Without this, even basic imports like 'import os' fail inside AppImage.
+    env.PYTHONHOME = PYTHON_DIR;
+
+    // PYTHONPATH: site-packages (pip deps) + stdlib fallback
+    const pyPaths = [sitePkgs];
+    if (fs.existsSync(stdlib)) pyPaths.push(stdlib);
+    env.PYTHONPATH = pyPaths.join(':') +
+      (process.env.PYTHONPATH ? ':' + process.env.PYTHONPATH : '');
+
+    // LD_LIBRARY_PATH: libfuse3.so.3, libpython3.x.so, libssl.so
+    env.LD_LIBRARY_PATH = sharedLibs +
+      (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : '');
   }
-  // Bundled shared libs (libfuse3, libpython)
-  const libDir = path.join(PYTHON_DIR, 'lib');
-  if (fs.existsSync(libDir)) {
-    env.LD_LIBRARY_PATH = libDir + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : '');
-  }
-  // Stdlib
-  const stdlib = path.join(PYTHON_DIR, 'stdlib');
-  if (fs.existsSync(stdlib)) {
-    env.PYTHONPATH = (env.PYTHONPATH ? env.PYTHONPATH + ':' : '') + stdlib;
-  }
+
   return env;
 }
 
@@ -82,7 +118,8 @@ const ICONS = {
 function openSettings() {
   if (settingsWin) { settingsWin.focus(); return; }
   settingsWin = new BrowserWindow({
-    width: 520, height: 700, resizable: false, title: 'Degoo Drive \u2014 Settings',
+    width: 320, height: 560, resizable: false, title: 'Degoo Drive',
+    frame: false, transparent: false,
     webPreferences: {
       nodeIntegration: false, contextIsolation: true,
       preload: path.join(__dirname, 'preload.js')
@@ -131,7 +168,7 @@ function stopMount() {
 function setStatus(s) {
   status = s;
   updateTray();
-  const msgs = { running: 'Mount started successfully.', error: 'Mount failed \u2014 check logs.' };
+  const msgs = { running: 'Mount started successfully.', error: 'Mount failed — check logs.' };
   if (msgs[s] && Notification.isSupported()) new Notification({ title: 'Degoo Drive', body: msgs[s] }).show();
   if (settingsWin) settingsWin.webContents.send('status', status);
 }
@@ -139,18 +176,18 @@ function setStatus(s) {
 function updateTray() {
   if (!tray) return;
   tray.setImage(ICONS[status]());
-  tray.setToolTip(`Degoo Drive \u2014 ${status}`);
+  tray.setToolTip(`Degoo Drive — ${status}`);
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: `\u25cf ${status.charAt(0).toUpperCase() + status.slice(1)}`, enabled: false },
+    { label: `● ${status.charAt(0).toUpperCase() + status.slice(1)}`, enabled: false },
     { type: 'separator' },
-    { label: '\u25b6  Start mount',  enabled: status !== 'running', click: startMount },
-    { label: '\u25a0  Stop mount',   enabled: status === 'running', click: stopMount },
+    { label: '▶  Start mount',  enabled: status !== 'running', click: startMount },
+    { label: '■  Stop mount',   enabled: status === 'running', click: stopMount },
     { type: 'separator' },
-    { label: '\ud83d\udcc2  Open folder', click: () => shell.openPath(store.get('mountpoint')) },
-    { label: '\u2699  Settings\u2026',   click: openSettings },
-    { label: '\ud83d\udccb  View logs\u2026',  click: () => shell.openPath(LOG_FILE) },
+    { label: '📂  Open folder', click: () => shell.openPath(store.get('mountpoint')) },
+    { label: '⚙  Settings…',   click: openSettings },
+    { label: '📋  View logs…',  click: () => shell.openPath(LOG_FILE) },
     { type: 'separator' },
-    { label: '\u2715  Quit', click: () => { stopMount(); app.quit(); } },
+    { label: '✕  Quit', click: () => { stopMount(); app.quit(); } },
   ]));
 }
 
@@ -165,12 +202,17 @@ ipcMain.handle('browse-folder', async () => {
   const r = await dialog.showOpenDialog({ properties: ['openDirectory'] });
   return r.canceled ? null : r.filePaths[0];
 });
+ipcMain.handle('open-external', (_, url)  => shell.openExternal(url));
+ipcMain.handle('open-folder',   (_, p)    => shell.openPath(p));
 
 app.whenReady().then(() => {
   app.setAppUserModelId('com.degoo.drive');
   tray = new Tray(ICONS.stopped());
-  tray.setToolTip('Degoo Drive \u2014 stopped');
-  tray.on('double-click', () => shell.openPath(store.get('mountpoint')));
+  tray.setToolTip('Degoo Drive — stopped');
+  tray.on('double-click', () => {
+    if (settingsWin) settingsWin.focus();
+    else openSettings();
+  });
   updateTray();
   if (store.get('startOnLaunch') && store.get('email')) setTimeout(startMount, 1000);
 });

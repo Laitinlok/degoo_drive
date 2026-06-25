@@ -72,6 +72,32 @@ _DEFAULT_CHUNK_CACHE_DIR = os.path.join(_CACHE_BASE, 'chunks')
 
 
 # ---------------------------------------------------------------------------
+# FUSE allow_other permission check
+# ---------------------------------------------------------------------------
+
+def _fuse3_allow_other_permitted() -> bool:
+    """Return True only when user_allow_other is enabled in /etc/fuse3.conf
+    (or the legacy /etc/fuse.conf).
+
+    FUSE raises a fatal "option allow_other only allowed if 'user_allow_other'
+    is set in /etc/fuse3.conf" error when the option is passed without the
+    sysadmin having opted in.  This check lets the GUI app pass --allow-other
+    safely: the flag is honoured when permitted and silently skipped otherwise.
+    """
+    for conf in ('/etc/fuse3.conf', '/etc/fuse.conf'):
+        try:
+            with open(conf) as fh:
+                for line in fh:
+                    stripped = line.strip()
+                    # accept bare "user_allow_other" or "user_allow_other = ..."
+                    if stripped.startswith('user_allow_other') and not stripped.startswith('#'):
+                        return True
+        except OSError:
+            pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # SQLite-backed tree cache
 # ---------------------------------------------------------------------------
 
@@ -1514,8 +1540,12 @@ def parse_args(args):
                         help='Enable debugging output')
     parser.add_argument('--debug-fuse', action='store_true', default=False,
                         help='Enable FUSE debugging output')
-    parser.add_argument('--allow-other', action='store_true',
-                        help='Allow access to another users')
+    parser.add_argument('--allow-other', action='store_true', default=False,
+                        help=(
+                            'Request allow_other FUSE option (lets other users access the mount). '
+                            'Silently ignored when user_allow_other is absent from /etc/fuse3.conf '
+                            'so the GUI app can always pass this flag without crashing.'
+                        ))
     parser.add_argument('--refresh-interval', type=int, default=10,
                         help='Refresh degoo content interval (default: 10 * 60sec)')
     parser.add_argument('--disable-refresh', action='store_true', default=False,
@@ -1547,32 +1577,24 @@ def parse_args(args):
                             'up to your line speed.'
                         ))
     parser.add_argument('--lookahead-chunks', type=int, default=2,
-                        help=(
-                            'Number of chunks to pre-fetch ahead of the current read position '
-                            '(default: 2). Higher values reduce stalls on sequential reads at '
-                            'the cost of extra memory and temp-disk usage.'
-                        ))
+                        help='Number of chunks to pre-fetch ahead of the current read position (default: 2)')
     parser.add_argument('--db-path', type=str, default=_DEFAULT_DB_PATH,
                         help=(
-                            'Path to the SQLite database used to persist the Degoo directory '
-                            'tree between mounts (default: %(default)s). '
-                            'Set to a tmpfs path for a volatile in-process cache, or to a '
-                            'shared volume path in Docker/Kubernetes deployments.'
+                            'Path to the SQLite database used to persist the directory tree '
+                            'and chunk-cache metadata (default: %(default)s). '
+                            'Point to a persistent volume path in Docker/Kubernetes so the '
+                            'cache survives container restarts.'
                         ))
     parser.add_argument('--chunk-cache-dir', type=str, default=_DEFAULT_CHUNK_CACHE_DIR,
                         help=(
-                            'Directory where downloaded file chunks are stored persistently '
-                            '(default: %(default)s). '
-                            'Point this at a large persistent volume to avoid re-downloading '
-                            'chunks across restarts.  Chunks are named '
-                            '<item_id>_<part>.chunk and evicted after --chunk-max-age seconds '
-                            'of inactivity.'
+                            'Directory where downloaded file chunks are stored '
+                            '(default: %(default)s).'
                         ))
     parser.add_argument('--chunk-max-age', type=int, default=3600,
                         help=(
-                            'Maximum age in seconds for a cached chunk before it is evicted '
-                            'by the maintenance thread (default: 3600 = 1 hour). '
-                            'Set to 0 to disable eviction entirely.'
+                            'Maximum age in seconds for cached chunks before they are evicted '
+                            'by the maintenance thread (default: 3600). '
+                            'Set to 0 to disable chunk eviction.'
                         ))
 
     return parser.parse_args(args)
@@ -1674,9 +1696,6 @@ def main():
 
     _client = DegooClient(debug=options.debug)
 
-    if options.allow_other:
-        log.debug('User access:         allow_other')
-
     Path(options.mountpoint).mkdir(parents=True, exist_ok=True)
 
     operations = Operations(
@@ -1703,7 +1722,15 @@ def main():
     fuse_options.add('fsname=fusedegoo')
 
     if options.allow_other:
-        fuse_options.add('allow_other')
+        if _fuse3_allow_other_permitted():
+            fuse_options.add('allow_other')
+            log.debug('FUSE allow_other: enabled')
+        else:
+            log.warning(
+                'allow_other requested but user_allow_other is not set in '
+                '/etc/fuse3.conf — mounting without allow_other. '
+                'Set user_allow_other in /etc/fuse3.conf to enable multi-user access.'
+            )
 
     mimetypes.init()
     if options.debug_fuse:
@@ -1718,25 +1745,21 @@ def main():
     run_maintenance = None
     if plex_split_file or chunk_max_age > 0:
         run_maintenance = operations.run_maintenance(
-            interval=60, max_chunk_age=chunk_max_age
+            interval=60,
+            max_chunk_age=chunk_max_age,
         )
 
     try:
-        log.debug('Entering main loop..')
         trio.run(pyfuse3.main)
-    except Exception:
-        print('Unexpected error: ', sys.exc_info()[0])
-        raise
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        log.debug('Error: %s', str(e))
+        raise e
     finally:
-        global is_refresh_enabled
-        is_refresh_enabled = False
-        if run_maintenance:
+        if run_maintenance is not None:
             run_maintenance.set()
-        operations._download_executor.shutdown(wait=False)
         pyfuse3.close(unmount=True)
-
-    log.debug('Unmounting..')
-    pyfuse3.close()
 
 
 if __name__ == '__main__':

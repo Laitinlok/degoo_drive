@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
@@ -7,375 +7,877 @@
         content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'"/>
   <title>Degoo Drive</title>
   <style>
+    /* ── Design tokens ──────────────────────────────── */
     :root {
-      --bg:   #1c1c1e;
-      --sf:   #2c2c2e;
-      --sf2:  #3a3a3c;
-      --bd:   #48484a;
-      --tx:   #f2f2f7;
-      --mu:   #8e8e93;
-      --pr:   #01a99c;
-      --prh:  #01877c;
-      --er:   #ff453a;
-      --warn: #ffd60a;
-      --r:    14px;
-      --f:    -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --bg:        #111113;
+      --sf:        #18181b;
+      --sf2:       #1f1f23;
+      --sf3:       #27272b;
+      --bd:        #3f3f46;
+      --bd-subtle: rgba(255,255,255,.06);
+      --tx:        #fafafa;
+      --tx-muted:  #a1a1aa;
+      --tx-faint:  #52525b;
+      --pr:        #01a99c;
+      --pr-hover:  #00897e;
+      --pr-hi:     rgba(1,169,156,.12);
+      --er:        #f87171;
+      --warn:      #fbbf24;
+      --ok:        #4ade80;
+      --r-sm:      6px;
+      --r-md:      10px;
+      --r-lg:      14px;
+      --r-xl:      18px;
+      --f:         -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+      --sidebar-w: 220px;
+      --titlebar-h: 38px;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; overflow: hidden; }
     body {
       font-family: var(--f);
-      font-size: 14px;
+      font-size: 13px;
       background: var(--bg);
       color: var(--tx);
       user-select: none;
-      -webkit-app-region: drag;
+      -webkit-user-select: none;
     }
-    button, input, a { -webkit-app-region: no-drag; }
+    button, input, select, a { -webkit-app-region: no-drag; }
+    :focus-visible { outline: 2px solid var(--pr); outline-offset: 2px; border-radius: var(--r-sm); }
 
-    /* ── Main panel ─────────────────────────────────── */
-    #main {
-      display: flex;
-      flex-direction: column;
-      height: 100vh;
-      width: 100%;
-    }
-
-    /* ── Top bar ─────────────────────────────────────── */
-    .topbar {
+    /* ── Custom titlebar ────────────────────────────── */
+    #titlebar {
+      height: var(--titlebar-h);
+      background: var(--sf);
+      border-bottom: 1px solid var(--bd-subtle);
       display: flex;
       align-items: center;
-      gap: 10px;
-      padding: 14px 16px 12px;
-      border-bottom: 1px solid rgba(255,255,255,.07);
-    }
-    .avatar {
-      width: 36px; height: 36px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, #6e6dcd, #9b59b6);
-      display: flex; align-items: center; justify-content: center;
-      font-size: 13px; font-weight: 700; color: #fff;
+      padding: 0 16px;
+      -webkit-app-region: drag;
       flex-shrink: 0;
+      gap: 10px;
     }
-    .account-info { flex: 1; min-width: 0; }
-    .account-email {
-      font-size: 13px; font-weight: 500;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    .tb-logo {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 13px; font-weight: 700; letter-spacing: .02em;
       color: var(--tx);
     }
-    .storage-bar-wrap { margin-top: 4px; }
+    .tb-logo svg { color: var(--pr); }
+    .tb-spacer { flex: 1; }
+    .tb-actions { display: flex; gap: 4px; }
+    .tb-btn {
+      width: 28px; height: 28px; border-radius: var(--r-sm);
+      background: none; border: none; color: var(--tx-muted);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; transition: background .15s, color .15s;
+    }
+    .tb-btn:hover { background: var(--sf3); color: var(--tx); }
+
+    /* ── Shell ──────────────────────────────────────── */
+    #shell {
+      display: flex;
+      height: calc(100vh - var(--titlebar-h));
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ────────────────────────────────────── */
+    #sidebar {
+      width: var(--sidebar-w);
+      background: var(--sf);
+      border-right: 1px solid var(--bd-subtle);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .sidebar-account {
+      padding: 14px 14px 12px;
+      border-bottom: 1px solid var(--bd-subtle);
+      flex-shrink: 0;
+    }
+    .acct-row { display: flex; align-items: center; gap: 10px; }
+    .acct-avatar {
+      width: 34px; height: 34px; border-radius: 50%;
+      background: linear-gradient(135deg,#4f46e5,#7c3aed);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; color: #fff;
+      flex-shrink: 0;
+    }
+    .acct-info { flex: 1; min-width: 0; }
+    .acct-email {
+      font-size: 12px; font-weight: 600; color: var(--tx);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .acct-plan { font-size: 11px; color: var(--tx-muted); margin-top: 1px; }
+    .storage-section { margin-top: 10px; }
+    .storage-numbers {
+      display: flex; justify-content: space-between;
+      font-size: 11px; color: var(--tx-muted); margin-bottom: 5px;
+    }
     .storage-track {
-      height: 4px; background: var(--sf2);
+      height: 4px; background: var(--sf3);
       border-radius: 2px; overflow: hidden;
     }
     .storage-fill {
       height: 100%; background: var(--pr);
-      border-radius: 2px; transition: width .4s;
+      border-radius: 2px; transition: width .5s ease;
     }
-    .storage-label {
-      font-size: 11px; color: var(--mu);
-      margin-top: 3px;
-    }
-    .topbar-icons {
-      display: flex; gap: 2px; flex-shrink: 0;
-    }
-    .icon-btn {
-      width: 30px; height: 30px;
-      border-radius: 8px;
-      background: none; border: none;
-      color: var(--mu);
-      display: flex; align-items: center; justify-content: center;
-      cursor: pointer; transition: background .15s, color .15s;
-    }
-    .icon-btn:hover { background: var(--sf2); color: var(--tx); }
-    .icon-btn svg { pointer-events: none; }
 
-    /* ── Status centre ───────────────────────────────── */
-    .status-centre {
-      flex: 1;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 0;
-      padding: 0 24px;
+    /* Nav */
+    .sidebar-nav { flex: 1; overflow-y: auto; padding: 8px 8px 0; }
+    .nav-section { margin-bottom: 6px; }
+    .nav-label {
+      font-size: 10px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .08em; color: var(--tx-faint);
+      padding: 6px 8px 4px;
     }
-    .status-icon-wrap {
-      width: 96px; height: 96px;
-      border-radius: 24px;
-      background: var(--sf);
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 7px 10px; border-radius: var(--r-md);
+      cursor: pointer; transition: background .12s, color .12s;
+      color: var(--tx-muted); font-size: 13px; font-weight: 500;
+      border: none; background: none; width: 100%; text-align: left;
+    }
+    .nav-item:hover { background: var(--sf3); color: var(--tx); }
+    .nav-item.active { background: var(--pr-hi); color: var(--pr); }
+    .nav-item svg { flex-shrink: 0; }
+    .nav-badge {
+      margin-left: auto; font-size: 10px; font-weight: 700;
+      background: var(--pr); color: #fff;
+      padding: 1px 6px; border-radius: 10px; min-width: 18px;
+      text-align: center;
+    }
+
+    /* Sidebar bottom */
+    .sidebar-bottom {
+      padding: 8px;
+      border-top: 1px solid var(--bd-subtle);
+      flex-shrink: 0;
+    }
+    .status-pill {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px; border-radius: var(--r-md);
+      background: var(--sf2);
+    }
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--tx-faint); flex-shrink: 0;
+      transition: background .3s;
+    }
+    .status-dot.running { background: var(--ok); box-shadow: 0 0 6px rgba(74,222,128,.5); }
+    .status-dot.error   { background: var(--er); }
+    .status-pill-label { flex: 1; font-size: 12px; font-weight: 500; color: var(--tx-muted); }
+    .status-pill-label.running { color: var(--ok); }
+    .status-pill-label.error   { color: var(--er); }
+
+    /* ── Main content ───────────────────────────────── */
+    #content { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+
+    /* ── Page views ─────────────────────────────────── */
+    .page { display: none; flex-direction: column; height: 100%; overflow: hidden; }
+    .page.active { display: flex; }
+    .page-header {
+      padding: 20px 24px 0;
+      flex-shrink: 0;
+    }
+    .page-title {
+      font-size: 20px; font-weight: 700; color: var(--tx);
+      margin-bottom: 4px;
+    }
+    .page-sub { font-size: 13px; color: var(--tx-muted); }
+
+    /* ── Sync page ──────────────────────────────────── */
+    #page-sync .sync-hero {
+      flex: 1;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 0; padding: 0 32px;
+    }
+    .hero-icon {
+      width: 88px; height: 88px; border-radius: 22px;
+      background: var(--sf2);
       display: flex; align-items: center; justify-content: center;
       margin-bottom: 20px;
       transition: background .3s;
     }
-    .status-icon-wrap.running { background: #0a2f31; }
-    .status-icon-wrap.error   { background: #2f1a1a; }
-    .status-svg { transition: opacity .2s; }
-
-    /* spinner */
+    .hero-icon.running { background: rgba(1,169,156,.12); }
+    .hero-icon.error   { background: rgba(248,113,113,.1); }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .spin-ring {
-      animation: spin 1s linear infinite;
-      transform-origin: 24px 24px;
+    .spin-ring { animation: spin 1s linear infinite; transform-origin: 24px 24px; }
+    .hero-title {
+      font-size: 16px; font-weight: 700; color: var(--tx);
+      text-align: center; margin-bottom: 6px;
+    }
+    .hero-sub {
+      font-size: 13px; color: var(--tx-muted);
+      text-align: center; max-width: 260px; line-height: 1.6;
+    }
+    .hero-actions { display: flex; gap: 10px; margin-top: 22px; }
+    .btn-primary {
+      padding: 9px 22px; border-radius: var(--r-md);
+      font-size: 13px; font-weight: 600;
+      background: var(--pr); color: #fff; border: none;
+      cursor: pointer; transition: background .15s;
+    }
+    .btn-primary:hover { background: var(--pr-hover); }
+    .btn-primary:disabled { opacity: .4; cursor: default; }
+    .btn-ghost {
+      padding: 9px 18px; border-radius: var(--r-md);
+      font-size: 13px; font-weight: 600;
+      background: var(--sf2); color: var(--tx-muted);
+      border: 1px solid var(--bd); cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+    .btn-ghost:hover { background: var(--sf3); color: var(--tx); }
+
+    /* Activity feed */
+    .activity-panel {
+      margin: 20px 24px 24px;
+      background: var(--sf);
+      border-radius: var(--r-xl);
+      border: 1px solid var(--bd-subtle);
+      overflow: hidden;
+    }
+    .activity-header {
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid var(--bd-subtle);
+      font-size: 12px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .07em;
+      color: var(--tx-faint);
+    }
+    .activity-list { max-height: 160px; overflow-y: auto; }
+    .activity-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 16px;
+      border-bottom: 1px solid var(--bd-subtle);
+      font-size: 12px;
+    }
+    .activity-item:last-child { border-bottom: none; }
+    .act-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--pr); flex-shrink: 0;
+    }
+    .act-dot.err { background: var(--er); }
+    .act-dot.warn { background: var(--warn); }
+    .act-msg { flex: 1; color: var(--tx-muted); }
+    .act-time { color: var(--tx-faint); white-space: nowrap; }
+    .activity-empty {
+      padding: 24px 16px; text-align: center;
+      color: var(--tx-faint); font-size: 12px;
     }
 
-    .status-title {
-      font-size: 15px; font-weight: 600;
-      color: var(--tx); text-align: center;
-      margin-bottom: 5px;
-    }
-    .status-sub {
-      font-size: 13px; color: var(--mu);
-      text-align: center; max-width: 220px;
-      line-height: 1.5;
-    }
-
-    /* ── Bottom pill ─────────────────────────────────── */
-    .bottom-bar {
-      padding: 12px 16px 14px;
-      border-top: 1px solid rgba(255,255,255,.07);
-    }
-    .sync-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--tx);
-    }
-    .pill-dot {
-      width: 10px; height: 10px;
-      border-radius: 50%;
-      background: var(--mu);
-      flex-shrink: 0;
-      transition: background .3s;
-    }
-    .pill-dot.running { background: var(--pr); }
-    .pill-dot.error   { background: var(--er); }
-
-    /* ── Settings panel (slide-in) ───────────────────── */
-    #settings {
-      position: fixed; inset: 0;
-      background: var(--bg);
-      transform: translateX(100%);
-      transition: transform .25s cubic-bezier(.4,0,.2,1);
-      display: flex; flex-direction: column;
-      z-index: 10;
+    /* ── Backup page ────────────────────────────────── */
+    #page-backup .backup-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 12px;
+      padding: 20px 24px;
       overflow-y: auto;
     }
-    #settings.open { transform: translateX(0); }
-    .settings-header {
-      display: flex; align-items: center; gap: 10px;
-      padding: 14px 16px 12px;
-      border-bottom: 1px solid rgba(255,255,255,.07);
-      flex-shrink: 0;
-    }
-    .back-btn {
-      width: 30px; height: 30px; border-radius: 8px;
-      background: none; border: none; color: var(--mu);
-      display: flex; align-items: center; justify-content: center;
-      cursor: pointer; transition: background .15s, color .15s;
-    }
-    .back-btn:hover { background: var(--sf2); color: var(--tx); }
-    .settings-header h2 { font-size: 15px; font-weight: 600; }
-    .settings-body { padding: 16px; flex: 1; }
-    .section {
+    .backup-card {
       background: var(--sf);
-      border-radius: var(--r);
-      padding: 14px;
-      margin-bottom: 12px;
+      border: 1px solid var(--bd-subtle);
+      border-radius: var(--r-lg);
+      padding: 16px;
     }
-    .stitle {
+    .bc-name { font-size: 13px; font-weight: 600; color: var(--tx); margin-bottom: 4px; }
+    .bc-path { font-size: 11px; color: var(--tx-faint); margin-bottom: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .bc-status { font-size: 11px; font-weight: 600; color: var(--ok); }
+    .bc-status.err { color: var(--er); }
+    .bc-add {
+      background: var(--sf);
+      border: 2px dashed var(--bd);
+      border-radius: var(--r-lg);
+      padding: 32px 16px;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 8px; cursor: pointer;
+      color: var(--tx-muted);
+      transition: border-color .15s, color .15s;
+    }
+    .bc-add:hover { border-color: var(--pr); color: var(--pr); }
+    .bc-add-label { font-size: 13px; font-weight: 600; }
+
+    /* ── Settings page ──────────────────────────────── */
+    #page-settings .settings-layout {
+      display: flex; flex: 1; overflow: hidden;
+    }
+    .settings-tabs {
+      width: 160px; flex-shrink: 0;
+      border-right: 1px solid var(--bd-subtle);
+      padding: 16px 8px;
+      overflow-y: auto;
+    }
+    .stab {
+      display: flex; align-items: center; gap: 9px;
+      padding: 8px 10px; border-radius: var(--r-md);
+      cursor: pointer; color: var(--tx-muted);
+      font-size: 13px; font-weight: 500;
+      border: none; background: none; width: 100%; text-align: left;
+      transition: background .12s, color .12s;
+    }
+    .stab:hover { background: var(--sf3); color: var(--tx); }
+    .stab.active { background: var(--pr-hi); color: var(--pr); }
+    .settings-panes { flex: 1; overflow-y: auto; padding: 20px 24px; }
+    .spane { display: none; }
+    .spane.active { display: block; }
+    .sgroup {
+      background: var(--sf);
+      border-radius: var(--r-lg);
+      border: 1px solid var(--bd-subtle);
+      overflow: hidden;
+      margin-bottom: 14px;
+    }
+    .sgroup-title {
+      padding: 12px 16px 8px;
       font-size: 11px; font-weight: 700;
-      letter-spacing: .08em; text-transform: uppercase;
-      color: var(--mu); margin-bottom: 12px;
+      text-transform: uppercase; letter-spacing: .08em;
+      color: var(--tx-faint);
+      border-bottom: 1px solid var(--bd-subtle);
     }
-    .field { margin-bottom: 10px; }
-    .field:last-child { margin-bottom: 0; }
-    label { display: block; font-size: 12px; color: var(--mu); margin-bottom: 4px; }
-    .row { display: flex; gap: 8px; }
+    .srow {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--bd-subtle);
+    }
+    .srow:last-child { border-bottom: none; }
+    .srow-label { flex: 1; }
+    .srow-label-text { font-size: 13px; color: var(--tx); font-weight: 500; }
+    .srow-label-hint { font-size: 11px; color: var(--tx-faint); margin-top: 2px; }
     input[type=text], input[type=email], input[type=password], input[type=number] {
-      width: 100%; padding: 8px 10px;
       background: var(--sf2); border: 1px solid var(--bd);
-      border-radius: 8px; color: var(--tx); font-size: 13px;
-      outline: none; transition: border-color .15s;
+      border-radius: var(--r-sm); color: var(--tx); font-size: 13px;
+      padding: 6px 10px; outline: none;
+      transition: border-color .15s;
     }
     input:focus { border-color: var(--pr); }
+    input[type=text].w-full, input[type=email].w-full,
+    input[type=password].w-full { width: 100%; }
     input[type=number] { width: 90px; }
-    .tog-row { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+    .srow input[type=text], .srow input[type=email],
+    .srow input[type=password] { width: 220px; }
+    .srow-browse { display: flex; gap: 8px; flex: 1; }
+    .srow-browse input { flex: 1; }
+    .btn-browse {
+      padding: 6px 12px; border-radius: var(--r-sm);
+      font-size: 12px; font-weight: 600;
+      background: var(--sf3); border: 1px solid var(--bd);
+      color: var(--tx-muted); cursor: pointer;
+      white-space: nowrap;
+      transition: background .15s, color .15s;
+    }
+    .btn-browse:hover { background: var(--bd); color: var(--tx); }
+    /* Toggle */
     .tog {
-      position: relative; width: 40px; height: 22px;
+      position: relative; width: 38px; height: 21px;
       background: var(--bd); border-radius: 11px;
-      transition: background .2s; flex-shrink: 0;
+      transition: background .2s; flex-shrink: 0; cursor: pointer;
+      border: none;
     }
     .tog.on { background: var(--pr); }
     .tog::after {
       content: ''; position: absolute;
-      top: 3px; left: 3px; width: 16px; height: 16px;
-      background: #fff; border-radius: 50%; transition: transform .2s;
+      top: 2px; left: 2px; width: 17px; height: 17px;
+      background: #fff; border-radius: 50%;
+      transition: transform .2s;
     }
-    .tog.on::after { transform: translateX(18px); }
-    .btns {
-      display: flex; gap: 10px; justify-content: flex-end;
-      padding: 0 16px 20px;
+    .tog.on::after { transform: translateX(17px); }
+    .settings-save-bar {
+      display: flex; align-items: center; justify-content: flex-end;
+      gap: 10px; padding: 0 24px 20px;
       flex-shrink: 0;
     }
-    .brw {
-      padding: 8px 12px;
-      background: var(--sf2); border: 1px solid var(--bd);
-      border-radius: 8px; color: var(--mu); font-size: 13px;
-      cursor: pointer; white-space: nowrap;
+    .save-ok {
+      font-size: 12px; color: var(--ok);
+      opacity: 0; transition: opacity .3s;
+      margin-right: auto;
     }
-    .brw:hover { background: var(--bd); color: var(--tx); }
-    .btn-save {
-      padding: 9px 22px; border-radius: 8px;
-      font-size: 14px; font-weight: 600;
-      cursor: pointer; border: none;
+    .save-ok.show { opacity: 1; }
+
+    /* ── Login screen ───────────────────────────────── */
+    #login {
+      position: fixed; inset: 0;
+      background: var(--bg);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100;
+    }
+    #login.hidden { display: none; }
+    .login-card {
+      background: var(--sf);
+      border: 1px solid var(--bd-subtle);
+      border-radius: var(--r-xl);
+      padding: 36px 32px;
+      width: 340px;
+    }
+    .login-logo {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 18px; font-weight: 800; color: var(--tx);
+      margin-bottom: 28px;
+    }
+    .login-logo svg { color: var(--pr); }
+    .login-title { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+    .login-sub { font-size: 13px; color: var(--tx-muted); margin-bottom: 24px; }
+    .login-field { margin-bottom: 14px; }
+    .login-field label { display: block; font-size: 12px; color: var(--tx-muted); margin-bottom: 5px; font-weight: 600; }
+    .login-field input { width: 100%; padding: 10px 12px; border-radius: var(--r-md); font-size: 13px; }
+    .btn-login {
+      width: 100%; padding: 11px;
       background: var(--pr); color: #fff;
-      transition: background .15s;
+      border: none; border-radius: var(--r-md);
+      font-size: 14px; font-weight: 700; cursor: pointer;
+      margin-top: 8px; transition: background .15s;
     }
-    .btn-save:hover { background: var(--prh); }
-    .btn-cancel {
-      padding: 9px 22px; border-radius: 8px;
-      font-size: 14px; font-weight: 600;
-      cursor: pointer;
-      background: var(--sf2); color: var(--mu);
-      border: 1px solid var(--bd);
-      transition: background .15s;
+    .btn-login:hover { background: var(--pr-hover); }
+    .login-err {
+      font-size: 12px; color: var(--er);
+      margin-top: 10px; text-align: center; min-height: 16px;
     }
-    .btn-cancel:hover { background: var(--bd); color: var(--tx); }
-    .ok {
-      text-align: center; color: var(--pr);
-      font-size: 13px; padding: 0 16px 12px;
-      opacity: 0; transition: opacity .3s; flex-shrink: 0;
+
+    /* ── About page ─────────────────────────────────── */
+    #page-about .about-body {
+      flex: 1; overflow-y: auto;
+      padding: 20px 24px;
     }
-    .ok.show { opacity: 1; }
+    .about-hero {
+      display: flex; align-items: center; gap: 16px;
+      padding: 20px; background: var(--sf);
+      border-radius: var(--r-xl);
+      border: 1px solid var(--bd-subtle);
+      margin-bottom: 14px;
+    }
+    .about-logo-box {
+      width: 56px; height: 56px; border-radius: var(--r-lg);
+      background: var(--pr-hi);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .about-app-name { font-size: 18px; font-weight: 800; }
+    .about-version { font-size: 12px; color: var(--tx-muted); }
+    .about-links { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+    .about-link {
+      padding: 6px 14px; border-radius: var(--r-md);
+      font-size: 12px; font-weight: 600;
+      background: var(--sf2); border: 1px solid var(--bd);
+      color: var(--tx-muted); cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+    .about-link:hover { background: var(--sf3); color: var(--tx); }
+
+    /* ── Scrollbar ──────────────────────────────────── */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--sf3); border-radius: 2px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--bd); }
   </style>
 </head>
 <body>
 
-<!-- ── Main sync panel ─────────────────────────────── -->
-<div id="main">
-  <div class="topbar">
-    <div class="avatar" id="avatar">AD</div>
-    <div class="account-info">
-      <div class="account-email" id="accountEmail">—</div>
-      <div class="storage-bar-wrap">
-        <div class="storage-track"><div class="storage-fill" id="storageFill" style="width:0%"></div></div>
-        <div class="storage-label" id="storageLabel">— of — GB</div>
-      </div>
-    </div>
-    <div class="topbar-icons">
-      <!-- Globe -->
-      <button class="icon-btn" title="Open Degoo web" id="webBtn">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10"/>
-          <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-        </svg>
-      </button>
-      <!-- Folder -->
-      <button class="icon-btn" title="Open mount folder" id="folderBtn">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
-      </button>
-      <!-- Gear -->
-      <button class="icon-btn" title="Settings" id="gearBtn">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="3"/>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-        </svg>
-      </button>
-    </div>
-  </div>
-
-  <div class="status-centre">
-    <div class="status-icon-wrap" id="iconWrap">
-      <!-- checkmark (stopped/synced) -->
-      <svg id="iconCheck" class="status-svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
-        <polyline points="12,26 20,34 36,16" stroke="#8e8e93" stroke-width="4"
-                  stroke-linecap="round" stroke-linejoin="round"/>
+<!-- ════════════════════════════════════════════════════
+     LOGIN SCREEN
+═══════════════════════════════════════════════════════ -->
+<div id="login">
+  <div class="login-card">
+    <div class="login-logo">
+      <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
+        <circle cx="16" cy="16" r="14" fill="currentColor" fill-opacity=".12" stroke="currentColor" stroke-width="2"/>
+        <path d="M10 16 C10 11 14 8 16 8 C20 8 22 11 22 16 C22 21 20 24 16 24 C12 24 10 21 10 16Z" fill="currentColor"/>
       </svg>
-      <!-- spinner (running) -->
-      <svg id="iconSpin" class="status-svg" width="48" height="48" viewBox="0 0 48 48"
-           fill="none" style="display:none">
-        <circle cx="24" cy="24" r="18" stroke="#0a3f42" stroke-width="4"/>
-        <path class="spin-ring" d="M24 6 a18 18 0 0 1 18 18"
-              stroke="var(--pr)" stroke-width="4" stroke-linecap="round"/>
-      </svg>
-      <!-- error -->
-      <svg id="iconErr" class="status-svg" width="48" height="48" viewBox="0 0 48 48"
-           fill="none" style="display:none">
-        <line x1="24" y1="14" x2="24" y2="28" stroke="var(--er)" stroke-width="4" stroke-linecap="round"/>
-        <circle cx="24" cy="35" r="2.5" fill="var(--er)"/>
-      </svg>
+      Degoo Drive
     </div>
-    <div class="status-title" id="statusTitle">Your files are up to date</div>
-    <div class="status-sub"  id="statusSub">Sync activity will show up here</div>
-  </div>
-
-  <div class="bottom-bar">
-    <div class="sync-pill">
-      <div class="pill-dot" id="pillDot"></div>
-      <span id="pillText">Stopped</span>
+    <div class="login-title">Sign in</div>
+    <div class="login-sub">Enter your Degoo credentials to continue</div>
+    <div class="login-field">
+      <label>Email address</label>
+      <input type="email" id="lEmail" placeholder="you@example.com" autocomplete="email"/>
     </div>
+    <div class="login-field">
+      <label>Password</label>
+      <input type="password" id="lPass" placeholder="••••••••" autocomplete="current-password"/>
+    </div>
+    <button class="btn-login" id="loginBtn">Sign in</button>
+    <div class="login-err" id="loginErr"></div>
   </div>
 </div>
 
-<!-- ── Settings panel ────────────────────────────────── -->
-<div id="settings">
-  <div class="settings-header">
-    <button class="back-btn" id="backBtn">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <polyline points="15 18 9 12 15 6"/>
+<!-- ════════════════════════════════════════════════════
+     MAIN APP SHELL
+═══════════════════════════════════════════════════════ -->
+<div id="titlebar">
+  <!-- Logo -->
+  <div class="tb-logo">
+    <svg width="20" height="20" viewBox="0 0 32 32" fill="none">
+      <circle cx="16" cy="16" r="14" stroke="currentColor" stroke-width="2" fill="none"/>
+      <path d="M10 16 C10 11 14 8 16 8 C20 8 22 11 22 16 C22 21 20 24 16 24 C12 24 10 21 10 16Z" fill="currentColor"/>
+    </svg>
+    Degoo Drive
+  </div>
+  <div class="tb-spacer" style="-webkit-app-region:drag"></div>
+  <div class="tb-actions">
+    <button class="tb-btn" id="tbFolder" title="Open mount folder">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
       </svg>
     </button>
-    <h2>Settings</h2>
+    <button class="tb-btn" id="tbWeb" title="Open Degoo web">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/>
+        <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+      </svg>
+    </button>
   </div>
-  <div class="settings-body">
-    <div class="section">
-      <div class="stitle">Account</div>
-      <div class="field"><label>Email</label><input type="email" id="email" placeholder="your@email.com"/></div>
-      <div class="field"><label>Password</label><input type="password" id="password" placeholder="••••••••"/></div>
-    </div>
-    <div class="section">
-      <div class="stitle">Mount</div>
-      <div class="field">
-        <label>Local folder</label>
-        <div class="row"><input type="text" id="mountpoint"/><button class="brw" id="browseBtn">Browse…</button></div>
+</div>
+
+<div id="shell">
+  <!-- ════ SIDEBAR ════ -->
+  <nav id="sidebar">
+    <!-- Account + storage -->
+    <div class="sidebar-account">
+      <div class="acct-row">
+        <div class="acct-avatar" id="sideAvatar">AD</div>
+        <div class="acct-info">
+          <div class="acct-email" id="sideEmail">loading…</div>
+          <div class="acct-plan">Degoo Cloud</div>
+        </div>
       </div>
-      <div class="field"><label>Degoo path</label><input type="text" id="degooPath" placeholder="/"/></div>
+      <div class="storage-section">
+        <div class="storage-numbers">
+          <span id="storageUsed">0 GB used</span>
+          <span id="storageTotal">2 TB</span>
+        </div>
+        <div class="storage-track"><div class="storage-fill" id="storageFill" style="width:0%"></div></div>
+      </div>
     </div>
-    <div class="section">
-      <div class="stitle">Performance</div>
-      <div class="field"><label>Cache size (MB)</label><input type="number" id="cacheSizeMb" min="32" max="2048"/></div>
-      <div class="field"><label>Refresh interval (min)</label><input type="number" id="refreshIntervalMin" min="1" max="1440"/></div>
-      <div class="field"><label>Download threads</label><input type="number" id="downloadThreads" min="1" max="32"/></div>
-      <div class="field"><label>Sub-chunk connections</label><input type="number" id="subchunkConnections" min="1" max="32"/></div>
-      <div class="field"><label>Lookahead chunks</label><input type="number" id="lookaheadChunks" min="1" max="16"/></div>
-      <div class="field"><label>Chunk max age (sec)</label><input type="number" id="chunkMaxAge" min="0" max="86400"/></div>
+
+    <!-- Nav links -->
+    <div class="sidebar-nav">
+      <div class="nav-section">
+        <div class="nav-label">Overview</div>
+        <button class="nav-item active" data-page="sync">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          Sync
+        </button>
+        <button class="nav-item" data-page="backup">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="8 17 12 21 16 17"/>
+            <line x1="12" y1="12" x2="12" y2="21"/>
+            <path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"/>
+          </svg>
+          Backups
+        </button>
+      </div>
+      <div class="nav-section">
+        <div class="nav-label">Preferences</div>
+        <button class="nav-item" data-page="settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          Settings
+        </button>
+        <button class="nav-item" data-page="about">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="12"/>
+            <line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+          About
+        </button>
+      </div>
     </div>
-    <div class="section">
-      <div class="stitle">Advanced</div>
-      <div class="field"><label>DB path</label><input type="text" id="dbPath"/></div>
-      <div class="field"><label>Chunk cache dir</label><input type="text" id="chunkCacheDir"/></div>
+
+    <!-- Status pill -->
+    <div class="sidebar-bottom">
+      <div class="status-pill">
+        <div class="status-dot" id="statusDot"></div>
+        <div class="status-pill-label" id="statusPillLabel">Stopped</div>
+      </div>
     </div>
-    <div class="section">
-      <div class="stitle">Options</div>
-      <div class="field">
-        <div class="tog-row" id="togRow">
-          <div class="tog" id="tog"></div>
-          <span>Start mount automatically on launch</span>
+  </nav>
+
+  <!-- ════ CONTENT ════ -->
+  <main id="content">
+
+    <!-- ── SYNC PAGE ── -->
+    <div id="page-sync" class="page active">
+      <div class="sync-hero">
+        <div class="hero-icon" id="heroIcon">
+          <!-- Idle check -->
+          <svg id="iconCheck" width="48" height="48" viewBox="0 0 48 48" fill="none">
+            <polyline points="13,26 21,34 35,16" stroke="#52525b" stroke-width="4"
+                      stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <!-- Running spinner -->
+          <svg id="iconSpin" width="48" height="48" viewBox="0 0 48 48" fill="none" style="display:none">
+            <circle cx="24" cy="24" r="18" stroke="#0a3f42" stroke-width="4"/>
+            <path class="spin-ring" d="M24 6 a18 18 0 0 1 18 18"
+                  stroke="var(--pr)" stroke-width="4" stroke-linecap="round"/>
+          </svg>
+          <!-- Error -->
+          <svg id="iconErr" width="48" height="48" viewBox="0 0 48 48" fill="none" style="display:none">
+            <line x1="24" y1="14" x2="24" y2="28" stroke="var(--er)" stroke-width="4" stroke-linecap="round"/>
+            <circle cx="24" cy="35" r="3" fill="var(--er)"/>
+          </svg>
+        </div>
+        <div class="hero-title" id="heroTitle">Your files are up to date</div>
+        <div class="hero-sub" id="heroSub">Start the mount to access your Degoo cloud storage as a local drive.</div>
+        <div class="hero-actions">
+          <button class="btn-primary" id="mountBtn">Start sync</button>
+          <button class="btn-ghost" id="openFolderBtn">Open folder</button>
+        </div>
+      </div>
+
+      <div class="activity-panel">
+        <div class="activity-header">Recent activity</div>
+        <div class="activity-list" id="activityList">
+          <div class="activity-empty" id="activityEmpty">No recent activity</div>
         </div>
       </div>
     </div>
-  </div>
-  <div class="btns">
-    <button class="btn-cancel" id="cancelBtn">Cancel</button>
-    <button class="btn-save" id="saveBtn">Save</button>
-  </div>
-  <div class="ok" id="ok">✓ Settings saved</div>
+
+    <!-- ── BACKUP PAGE ── -->
+    <div id="page-backup" class="page">
+      <div class="page-header">
+        <div class="page-title">Backups</div>
+        <div class="page-sub">Automatically back up folders to your Degoo cloud.</div>
+      </div>
+      <div class="backup-grid" id="backupGrid">
+        <button class="bc-add" id="addBackupBtn">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          <div class="bc-add-label">Add folder backup</div>
+          <div style="font-size:11px;color:var(--tx-faint)">Choose a folder to sync to Degoo</div>
+        </button>
+      </div>
+    </div>
+
+    <!-- ── SETTINGS PAGE ── -->
+    <div id="page-settings" class="page">
+      <div class="page-header" style="padding-bottom:14px">
+        <div class="page-title">Settings</div>
+      </div>
+      <div class="settings-layout">
+        <div class="settings-tabs">
+          <button class="stab active" data-stab="account">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+            Account
+          </button>
+          <button class="stab" data-stab="mount">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+            Mount
+          </button>
+          <button class="stab" data-stab="perf">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+            </svg>
+            Performance
+          </button>
+          <button class="stab" data-stab="advanced">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/>
+              <line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/>
+              <line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/>
+              <line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/>
+              <line x1="17" y1="16" x2="23" y2="16"/>
+            </svg>
+            Advanced
+          </button>
+        </div>
+
+        <div class="settings-panes">
+          <!-- Account -->
+          <div class="spane active" id="spane-account">
+            <div class="sgroup">
+              <div class="sgroup-title">Degoo credentials</div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Email address</div>
+                </div>
+                <input type="email" id="sEmail" placeholder="you@example.com"/>
+              </div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Password</div>
+                </div>
+                <input type="password" id="sPass" placeholder="••••••••"/>
+              </div>
+            </div>
+            <div class="sgroup">
+              <div class="sgroup-title">General</div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Start mount on launch</div>
+                  <div class="srow-label-hint">Automatically connect when the app opens</div>
+                </div>
+                <button class="tog" id="togLaunch"></button>
+              </div>
+            </div>
+            <div class="sgroup">
+              <div class="sgroup-title">Danger zone</div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Sign out</div>
+                  <div class="srow-label-hint">Clear credentials and stop mount</div>
+                </div>
+                <button class="btn-ghost" id="signOutBtn" style="color:var(--er);border-color:rgba(248,113,113,.3)">Sign out</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mount -->
+          <div class="spane" id="spane-mount">
+            <div class="sgroup">
+              <div class="sgroup-title">File system mount</div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Local mount folder</div>
+                  <div class="srow-label-hint">Where your Degoo files appear on disk</div>
+                </div>
+                <div class="srow-browse">
+                  <input type="text" id="sMountpoint"/>
+                  <button class="btn-browse" id="sBrowseMount">Browse…</button>
+                </div>
+              </div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Degoo path</div>
+                  <div class="srow-label-hint">Root path inside your Degoo account</div>
+                </div>
+                <input type="text" id="sDegooPath" placeholder="/" style="width:180px"/>
+              </div>
+            </div>
+          </div>
+
+          <!-- Performance -->
+          <div class="spane" id="spane-perf">
+            <div class="sgroup">
+              <div class="sgroup-title">Cache</div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Cache size (MB)</div>
+                  <div class="srow-label-hint">RAM used for read-ahead chunks</div>
+                </div>
+                <input type="number" id="sCacheMb" min="32" max="2048"/>
+              </div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Chunk max age (sec)</div>
+                </div>
+                <input type="number" id="sChunkAge" min="0" max="86400"/>
+              </div>
+            </div>
+            <div class="sgroup">
+              <div class="sgroup-title">Concurrency</div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Download threads</div>
+                </div>
+                <input type="number" id="sThreads" min="1" max="32"/>
+              </div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Sub-chunk connections</div>
+                </div>
+                <input type="number" id="sSubchunk" min="1" max="32"/>
+              </div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Lookahead chunks</div>
+                </div>
+                <input type="number" id="sLookahead" min="1" max="16"/>
+              </div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Refresh interval (min)</div>
+                  <div class="srow-label-hint">How often to re-scan the remote tree</div>
+                </div>
+                <input type="number" id="sRefresh" min="1" max="1440"/>
+              </div>
+            </div>
+          </div>
+
+          <!-- Advanced -->
+          <div class="spane" id="spane-advanced">
+            <div class="sgroup">
+              <div class="sgroup-title">Storage locations</div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">SQLite DB path</div>
+                  <div class="srow-label-hint">Tree cache database file</div>
+                </div>
+                <div class="srow-browse">
+                  <input type="text" id="sDbPath"/>
+                  <button class="btn-browse" id="sBrowseDb">Browse…</button>
+                </div>
+              </div>
+              <div class="srow">
+                <div class="srow-label">
+                  <div class="srow-label-text">Chunk cache dir</div>
+                  <div class="srow-label-hint">Disk cache for downloaded chunks</div>
+                </div>
+                <div class="srow-browse">
+                  <input type="text" id="sChunkDir"/>
+                  <button class="btn-browse" id="sBrowseChunk">Browse…</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-save-bar">
+        <span class="save-ok" id="saveOk">✓ Settings saved</span>
+        <button class="btn-ghost" id="sCancelBtn">Cancel</button>
+        <button class="btn-primary" id="sSaveBtn">Save changes</button>
+      </div>
+    </div>
+
+    <!-- ── ABOUT PAGE ── -->
+    <div id="page-about" class="page">
+      <div class="about-body">
+        <div class="about-hero">
+          <div class="about-logo-box">
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+              <circle cx="16" cy="16" r="14" stroke="var(--pr)" stroke-width="2" fill="none"/>
+              <path d="M10 16 C10 11 14 8 16 8 C20 8 22 11 22 16 C22 21 20 24 16 24 C12 24 10 21 10 16Z" fill="var(--pr)"/>
+            </svg>
+          </div>
+          <div>
+            <div class="about-app-name">Degoo Drive</div>
+            <div class="about-version" id="aboutVersion">Version 1.0.0</div>
+            <div class="about-links">
+              <button class="about-link" id="aGithub">GitHub</button>
+              <button class="about-link" id="aDegooWeb">Degoo.com</button>
+              <button class="about-link" id="aLogs">View logs</button>
+            </div>
+          </div>
+        </div>
+        <div class="sgroup">
+          <div class="sgroup-title">Mount info</div>
+          <div class="srow">
+            <div class="srow-label"><div class="srow-label-text">Mount point</div></div>
+            <div style="font-size:12px;color:var(--tx-muted)" id="infoMount">—</div>
+          </div>
+          <div class="srow">
+            <div class="srow-label"><div class="srow-label-text">DB path</div></div>
+            <div style="font-size:12px;color:var(--tx-muted)" id="infoDb">—</div>
+          </div>
+          <div class="srow">
+            <div class="srow-label"><div class="srow-label-text">Chunk cache</div></div>
+            <div style="font-size:12px;color:var(--tx-muted)" id="infoChunk">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
 </div>
 
 <script src="app.js"></script>

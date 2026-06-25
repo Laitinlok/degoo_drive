@@ -1,195 +1,269 @@
-/* Renderer process — communicates with main via contextBridge (preload) */
 'use strict';
 
-const api = window.electronAPI;
+// ── State ───────────────────────────────────────────────
+let settings = {};
+let mountStatus = 'stopped';
+let activityLog = [];
 
-// ── DOM refs ──────────────────────────────────────────────────────────────
-const avatar        = document.getElementById('avatar');
-const accountEmail  = document.getElementById('accountEmail');
-const storageFill   = document.getElementById('storageFill');
-const storageLabel  = document.getElementById('storageLabel');
-const iconWrap      = document.getElementById('iconWrap');
-const iconCheck     = document.getElementById('iconCheck');
-const iconSpin      = document.getElementById('iconSpin');
-const iconErr       = document.getElementById('iconErr');
-const statusTitle   = document.getElementById('statusTitle');
-const statusSub     = document.getElementById('statusSub');
-const pillDot       = document.getElementById('pillDot');
-const pillText      = document.getElementById('pillText');
-const gearBtn       = document.getElementById('gearBtn');
-const folderBtn     = document.getElementById('folderBtn');
-const webBtn        = document.getElementById('webBtn');
-const settingsPanel = document.getElementById('settings');
-const backBtn       = document.getElementById('backBtn');
-const cancelBtn     = document.getElementById('cancelBtn');
-const saveBtn       = document.getElementById('saveBtn');
-const browseBtn     = document.getElementById('browseBtn');
-const togRow        = document.getElementById('togRow');
-const tog           = document.getElementById('tog');
-const okMsg         = document.getElementById('ok');
-
-// ── Status render ─────────────────────────────────────────────────────────
-const STATUS_CONFIG = {
-  stopped: {
-    icon: 'check',
-    wrapClass: '',
-    title: 'Your files are up to date',
-    sub:   'Sync activity will show up here',
-    dot:   '',
-    pill:  'Stopped',
-    checkStroke: '#8e8e93',
-  },
-  running: {
-    icon: 'spin',
-    wrapClass: 'running',
-    title: 'Syncing…',
-    sub:   'Connecting to Degoo',
-    dot:   'running',
-    pill:  'Syncing',
-    checkStroke: '#8e8e93',
-  },
-  synced: {
-    icon: 'check',
-    wrapClass: 'running',
-    title: 'Your files are up to date',
-    sub:   'Sync activity will show up here',
-    dot:   'running',
-    pill:  'Fully synced',
-    checkStroke: '#01a99c',
-  },
-  error: {
-    icon: 'err',
-    wrapClass: 'error',
-    title: 'Sync paused',
-    sub:   'Check settings or view logs',
-    dot:   'error',
-    pill:  'Error',
-    checkStroke: '#8e8e93',
-  },
-};
-
-function applyStatus(raw) {
-  // Map main-process states → UI states
-  const state = raw === 'running' ? 'synced' : (STATUS_CONFIG[raw] ? raw : 'stopped');
-  const cfg = STATUS_CONFIG[state];
-
-  // icon
-  iconCheck.style.display = cfg.icon === 'check' ? '' : 'none';
-  iconSpin.style.display  = cfg.icon === 'spin'  ? '' : 'none';
-  iconErr.style.display   = cfg.icon === 'err'   ? '' : 'none';
-  if (cfg.icon === 'check') {
-    iconCheck.querySelector('polyline').setAttribute('stroke', cfg.checkStroke);
-  }
-
-  // wrap bg
-  iconWrap.className = 'status-icon-wrap' + (cfg.wrapClass ? ' ' + cfg.wrapClass : '');
-
-  // text
-  statusTitle.textContent = cfg.title;
-  statusSub.textContent   = cfg.sub;
-
-  // pill
-  pillDot.className  = 'pill-dot' + (cfg.dot ? ' ' + cfg.dot : '');
-  pillText.textContent = cfg.pill;
+// ── Helpers ─────────────────────────────────────────────
+const el  = id => document.getElementById(id);
+const fmt = n  => n >= 1024 ? (n / 1024).toFixed(1) + ' TB' : n.toFixed(0) + ' GB';
+function ts() {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
 }
 
-// ── Load settings into form ───────────────────────────────────────────────
-function initials(email) {
-  if (!email) return 'DD';
-  const parts = email.split('@')[0].split(/[._-]/);
-  return (parts[0][0] + (parts[1] ? parts[1][0] : parts[0][1] || '')).toUpperCase();
+// ── Navigation ──────────────────────────────────────────
+function navigate(pageId) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+  const page = el('page-' + pageId);
+  if (page) page.classList.add('active');
+  const navBtn = document.querySelector(`.nav-item[data-page="${pageId}"]`);
+  if (navBtn) navBtn.classList.add('active');
+}
+document.querySelectorAll('.nav-item').forEach(btn => {
+  btn.addEventListener('click', () => navigate(btn.dataset.page));
+});
+
+// ── Settings tabs ────────────────────────────────────────
+function switchSettingsTab(tabId) {
+  document.querySelectorAll('.stab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.spane').forEach(p => p.classList.remove('active'));
+  const tab  = document.querySelector(`.stab[data-stab="${tabId}"]`);
+  const pane = el('spane-' + tabId);
+  if (tab)  tab.classList.add('active');
+  if (pane) pane.classList.add('active');
+}
+document.querySelectorAll('.stab').forEach(btn => {
+  btn.addEventListener('click', () => switchSettingsTab(btn.dataset.stab));
+});
+
+// ── Login screen ─────────────────────────────────────────
+function showLogin() {
+  el('login').classList.remove('hidden');
+}
+function hideLogin() {
+  el('login').classList.add('hidden');
 }
 
+el('loginBtn').addEventListener('click', async () => {
+  const email = el('lEmail').value.trim();
+  const pass  = el('lPass').value;
+  el('loginErr').textContent = '';
+  if (!email || !pass) { el('loginErr').textContent = 'Please enter email and password.'; return; }
+  const s = await window.electronAPI.getSettings();
+  await window.electronAPI.saveSettings({ ...s, email, password: pass });
+  hideLogin();
+  loadSettings();
+  logActivity('Signed in as ' + email, 'ok');
+});
+el('lPass').addEventListener('keydown', e => { if (e.key === 'Enter') el('loginBtn').click(); });
+
+// ── Load settings into UI ────────────────────────────────
 async function loadSettings() {
-  const s = await api.getSettings();
+  settings = await window.electronAPI.getSettings();
 
-  // Top bar
-  accountEmail.textContent = s.email || 'Not signed in';
-  avatar.textContent = initials(s.email);
+  // Sidebar account
+  const email = settings.email || '';
+  el('sideEmail').textContent = email || 'Not signed in';
+  el('sideAvatar').textContent = email ? email[0].toUpperCase() : '?';
 
-  // Storage bar — degoo total is 2 TB = 2048 GB; used comes from email header
-  // We don't have live quota data here, so show a placeholder derived from stored values
-  const usedGb  = parseFloat(s.storageUsedGb  || 0);
-  const totalGb = parseFloat(s.storageTotalGb || 2048);
-  const pct = totalGb > 0 ? Math.min((usedGb / totalGb) * 100, 100) : 0;
-  storageFill.style.width = pct + '%';
-  storageLabel.textContent = usedGb > 0
-    ? `${usedGb.toFixed(2)} GB of ${totalGb >= 1024 ? (totalGb/1024).toFixed(0)+'TB' : totalGb+'GB'}`
-    : 'Storage usage unknown';
+  // Storage
+  const usedGb  = parseFloat(settings.storageUsedGb)  || 0;
+  const totalGb = parseFloat(settings.storageTotalGb) || 2048;
+  const pct     = Math.min((usedGb / totalGb) * 100, 100);
+  el('storageFill').style.width = pct + '%';
+  el('storageUsed').textContent  = fmt(usedGb)  + ' used';
+  el('storageTotal').textContent = fmt(totalGb);
 
-  // Form fields
-  document.getElementById('email').value              = s.email              || '';
-  document.getElementById('password').value           = s.password           || '';
-  document.getElementById('mountpoint').value         = s.mountpoint         || '';
-  document.getElementById('degooPath').value          = s.degooPath          || '/';
-  document.getElementById('cacheSizeMb').value        = s.cacheSizeMb        || 128;
-  document.getElementById('refreshIntervalMin').value = s.refreshIntervalMin || 10;
-  document.getElementById('downloadThreads').value    = s.downloadThreads    || 8;
-  document.getElementById('subchunkConnections').value= s.subchunkConnections|| 8;
-  document.getElementById('lookaheadChunks').value    = s.lookaheadChunks    || 2;
-  document.getElementById('chunkMaxAge').value        = s.chunkMaxAge        || 3600;
-  document.getElementById('dbPath').value             = s.dbPath             || '';
-  document.getElementById('chunkCacheDir').value      = s.chunkCacheDir      || '';
-  tog.classList.toggle('on', !!s.startOnLaunch);
+  // Settings form
+  el('sEmail').value      = settings.email            || '';
+  el('sPass').value       = settings.password         || '';
+  el('sMountpoint').value = settings.mountpoint       || '';
+  el('sDegooPath').value  = settings.degooPath        || '/';
+  el('sCacheMb').value    = settings.cacheSizeMb      || 128;
+  el('sChunkAge').value   = settings.chunkMaxAge      || 3600;
+  el('sThreads').value    = settings.downloadThreads  || 8;
+  el('sSubchunk').value   = settings.subchunkConnections || 8;
+  el('sLookahead').value  = settings.lookaheadChunks  || 2;
+  el('sRefresh').value    = settings.refreshIntervalMin || 10;
+  el('sDbPath').value     = settings.dbPath           || '';
+  el('sChunkDir').value   = settings.chunkCacheDir    || '';
+  const togEl = el('togLaunch');
+  if (settings.startOnLaunch) togEl.classList.add('on');
+  else togEl.classList.remove('on');
+
+  // About info
+  el('infoMount').textContent = settings.mountpoint   || '—';
+  el('infoDb').textContent    = settings.dbPath       || '—';
+  el('infoChunk').textContent = settings.chunkCacheDir || '—';
+
+  // Show login if no credentials
+  if (!settings.email || !settings.password) showLogin();
+  else hideLogin();
 }
 
-// ── Settings panel open/close ─────────────────────────────────────────────
-function openSettings()  { settingsPanel.classList.add('open'); }
-function closeSettings() { settingsPanel.classList.remove('open'); }
+// ── Status rendering ─────────────────────────────────────
+function renderStatus(s) {
+  mountStatus = s;
+  const dot   = el('statusDot');
+  const label = el('statusPillLabel');
+  const heroI = el('heroIcon');
+  const title = el('heroTitle');
+  const sub   = el('heroSub');
+  const btn   = el('mountBtn');
 
-gearBtn.addEventListener('click', openSettings);
-backBtn.addEventListener('click', closeSettings);
-cancelBtn.addEventListener('click', closeSettings);
+  dot.className   = 'status-dot ' + s;
+  label.className = 'status-pill-label ' + s;
 
-// ── Toggle ────────────────────────────────────────────────────────────────
-togRow.addEventListener('click', () => tog.classList.toggle('on'));
+  el('iconCheck').style.display = 'none';
+  el('iconSpin').style.display  = 'none';
+  el('iconErr').style.display   = 'none';
 
-// ── Browse ────────────────────────────────────────────────────────────────
-browseBtn.addEventListener('click', async () => {
-  const p = await api.browseFolder();
-  if (p) document.getElementById('mountpoint').value = p;
+  heroI.classList.remove('running', 'error');
+
+  if (s === 'running') {
+    label.textContent = 'Syncing';
+    el('iconSpin').style.display = 'block';
+    heroI.classList.add('running');
+    title.textContent = 'Syncing your files…';
+    sub.textContent   = 'Your Degoo drive is mounted and syncing.';
+    btn.textContent   = 'Stop sync';
+    btn.disabled      = false;
+  } else if (s === 'error') {
+    label.textContent = 'Error';
+    el('iconErr').style.display = 'block';
+    heroI.classList.add('error');
+    title.textContent = 'Something went wrong';
+    sub.textContent   = 'Check logs for details, then try restarting.';
+    btn.textContent   = 'Retry';
+    btn.disabled      = false;
+  } else {
+    label.textContent = 'Stopped';
+    el('iconCheck').style.display = 'block';
+    title.textContent = 'Your files are up to date';
+    sub.textContent   = 'Start the mount to access your Degoo cloud storage as a local drive.';
+    btn.textContent   = 'Start sync';
+    btn.disabled      = false;
+  }
+}
+
+// ── Activity log ─────────────────────────────────────────
+function logActivity(msg, type = 'ok') {
+  activityLog.unshift({ msg, type, time: ts() });
+  if (activityLog.length > 50) activityLog.pop();
+  renderActivity();
+}
+function renderActivity() {
+  const list  = el('activityList');
+  const empty = el('activityEmpty');
+  if (!activityLog.length) { empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+  list.innerHTML = activityLog.map(e => `
+    <div class="activity-item">
+      <div class="act-dot${e.type === 'err' ? ' err' : e.type === 'warn' ? ' warn' : ''}"></div>
+      <div class="act-msg">${e.msg}</div>
+      <div class="act-time">${e.time}</div>
+    </div>`).join('') + `<div class="activity-empty" id="activityEmpty" style="display:none">No recent activity</div>`;
+}
+
+// ── Mount button ─────────────────────────────────────────
+el('mountBtn').addEventListener('click', async () => {
+  if (mountStatus === 'running') {
+    // stop
+    await window.electronAPI.saveSettings({ ...settings, _action: 'stop' });
+    logActivity('Mount stopped', 'warn');
+  } else {
+    if (!settings.email || !settings.password) { showLogin(); return; }
+    logActivity('Starting mount…', 'ok');
+    await window.electronAPI.saveSettings({ ...settings });
+  }
 });
 
-// ── Save ─────────────────────────────────────────────────────────────────
-saveBtn.addEventListener('click', async () => {
-  const data = {
-    email:               document.getElementById('email').value.trim(),
-    password:            document.getElementById('password').value,
-    mountpoint:          document.getElementById('mountpoint').value.trim(),
-    degooPath:           document.getElementById('degooPath').value.trim() || '/',
-    cacheSizeMb:         +document.getElementById('cacheSizeMb').value,
-    refreshIntervalMin:  +document.getElementById('refreshIntervalMin').value,
-    downloadThreads:     +document.getElementById('downloadThreads').value,
-    subchunkConnections: +document.getElementById('subchunkConnections').value,
-    lookaheadChunks:     +document.getElementById('lookaheadChunks').value,
-    chunkMaxAge:         +document.getElementById('chunkMaxAge').value,
-    dbPath:              document.getElementById('dbPath').value.trim(),
-    chunkCacheDir:       document.getElementById('chunkCacheDir').value.trim(),
-    startOnLaunch:       tog.classList.contains('on'),
+el('openFolderBtn').addEventListener('click', () => {
+  window.electronAPI.openFolder(settings.mountpoint);
+});
+
+// ── Settings save/cancel ─────────────────────────────────
+el('sSaveBtn').addEventListener('click', async () => {
+  const updated = {
+    email:                el('sEmail').value.trim(),
+    password:             el('sPass').value,
+    mountpoint:           el('sMountpoint').value.trim(),
+    degooPath:            el('sDegooPath').value.trim() || '/',
+    cacheSizeMb:          Number(el('sCacheMb').value),
+    chunkMaxAge:          Number(el('sChunkAge').value),
+    downloadThreads:      Number(el('sThreads').value),
+    subchunkConnections:  Number(el('sSubchunk').value),
+    lookaheadChunks:      Number(el('sLookahead').value),
+    refreshIntervalMin:   Number(el('sRefresh').value),
+    dbPath:               el('sDbPath').value.trim(),
+    chunkCacheDir:        el('sChunkDir').value.trim(),
+    startOnLaunch:        el('togLaunch').classList.contains('on'),
   };
-  await api.saveSettings(data);
-  await loadSettings();
-  okMsg.classList.add('show');
-  setTimeout(() => { okMsg.classList.remove('show'); closeSettings(); }, 1400);
+  await window.electronAPI.saveSettings(updated);
+  settings = { ...settings, ...updated };
+  const ok = el('saveOk');
+  ok.classList.add('show');
+  setTimeout(() => ok.classList.remove('show'), 2500);
+  logActivity('Settings saved', 'ok');
+  loadSettings();
 });
+el('sCancelBtn').addEventListener('click', loadSettings);
 
-// ── Quick actions ─────────────────────────────────────────────────────────
-folderBtn.addEventListener('click', async () => {
-  const s = await api.getSettings();
-  api.openFolder(s.mountpoint);
-});
-webBtn.addEventListener('click', () => {
-  api.openExternal('https://app.degoo.com');
-});
-
-// ── Status listener ───────────────────────────────────────────────────────
-if (api.onStatus) {
-  api.onStatus((_, s) => applyStatus(s));
+// Browse buttons
+async function browse(inputId) {
+  const p = await window.electronAPI.browseFolder();
+  if (p) el(inputId).value = p;
 }
+el('sBrowseMount').addEventListener('click', () => browse('sMountpoint'));
+el('sBrowseDb').addEventListener('click',    () => browse('sDbPath'));
+el('sBrowseChunk').addEventListener('click', () => browse('sChunkDir'));
 
-// ── Init ─────────────────────────────────────────────────────────────────
+// Toggle
+el('togLaunch').addEventListener('click', () => el('togLaunch').classList.toggle('on'));
+
+// Sign out
+el('signOutBtn').addEventListener('click', async () => {
+  await window.electronAPI.saveSettings({ ...settings, email: '', password: '', _action: 'stop' });
+  logActivity('Signed out', 'warn');
+  await loadSettings();
+});
+
+// ── Titlebar buttons ─────────────────────────────────────
+el('tbFolder').addEventListener('click', () => window.electronAPI.openFolder(settings.mountpoint));
+el('tbWeb').addEventListener('click',    () => window.electronAPI.openExternal('https://app.degoo.com'));
+
+// ── About page buttons ───────────────────────────────────
+el('aGithub').addEventListener('click',  () => window.electronAPI.openExternal('https://github.com/Laitinlok/degoo_drive'));
+el('aDegooWeb').addEventListener('click',() => window.electronAPI.openExternal('https://degoo.com'));
+el('aLogs').addEventListener('click',    () => window.electronAPI.openExternal('logs'));
+
+// ── Backup add ───────────────────────────────────────────
+el('addBackupBtn').addEventListener('click', async () => {
+  const p = await window.electronAPI.browseFolder();
+  if (!p) return;
+  const card = document.createElement('div');
+  card.className = 'backup-card';
+  const name = p.split('/').pop() || p;
+  card.innerHTML = `
+    <div class="bc-name">${name}</div>
+    <div class="bc-path">${p}</div>
+    <div class="bc-status">Active</div>`;
+  el('addBackupBtn').insertAdjacentElement('beforebegin', card);
+  logActivity('Backup added: ' + name, 'ok');
+});
+
+// ── Status listener from main process ───────────────────
+window.electronAPI.onStatus((_, s) => {
+  renderStatus(s);
+  logActivity(s === 'running' ? 'Mount started' : s === 'error' ? 'Mount error — check logs' : 'Mount stopped', s === 'error' ? 'err' : s === 'running' ? 'ok' : 'warn');
+});
+
+// ── Init ─────────────────────────────────────────────────
 (async () => {
   await loadSettings();
-  const s = await api.getStatus();
-  applyStatus(s);
+  const s = await window.electronAPI.getStatus();
+  renderStatus(s);
 })();

@@ -1,0 +1,43 @@
+{
+  "name": "degoo-drive",
+  "productName": "Degoo Drive",
+  "version": "0.1.0",
+  "description": "Sync and mount your Degoo cloud storage — inspired by Internxt Drive",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --linux AppImage",
+    "build:deb": "electron-builder --linux deb",
+    "build:all": "electron-builder --linux AppImage deb"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.0"
+  },
+  "build": {
+    "appId": "com.degoo.drive",
+    "productName": "Degoo Drive",
+    "directories": { "output": "dist" },
+    "files": ["src/**/*", "assets/**/*"],
+    "extraResources": [
+      { "from": "../fuse_degoo.py",      "to": "fuse_degoo.py" },
+      { "from": "../python/degoo_sync/",  "to": "degoo_sync/" }
+    ],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Network",
+      "icon": "assets/icon.png",
+      "synopsis": "Sync and mount Degoo cloud storage"
+    },
+    "appImage": {
+      "artifactName": "degoo-drive-${version}-linux-x86_64.AppImage"
+    },
+    "deb": {
+      "artifactName": "degoo-drive-${version}-linux-amd64.deb",
+      "depends": ["python3", "python3-pip", "fuse3", "libfuse3-dev"]
+    }
+  }
+}

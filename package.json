@@ -3,6 +3,10 @@
   "productName": "Degoo Drive",
   "version": "0.1.0",
   "description": "Mount and sync your Degoo cloud storage",
+  "author": {
+    "name": "Laitinlok",
+    "email": "63400461+Laitinlok@users.noreply.github.com"
+  },
   "main": "src/main/index.js",
   "scripts": {
     "start": "electron .",
@@ -27,7 +31,8 @@
       "target": ["AppImage", "deb"],
       "category": "Network",
       "icon": "assets/icon.png",
-      "synopsis": "Degoo cloud storage FUSE mount"
+      "synopsis": "Degoo cloud storage FUSE mount",
+      "maintainer": "Laitinlok <63400461+Laitinlok@users.noreply.github.com>"
     },
     "appImage": { "artifactName": "degoo-drive-${version}-linux-x86_64.AppImage" },
     "deb":      { "artifactName": "degoo-drive-${version}-linux-amd64.deb" }

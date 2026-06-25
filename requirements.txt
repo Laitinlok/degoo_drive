@@ -1,7 +1,7 @@
 # cligoo replaces the bundled degoo/__init__.py as the Degoo API backend.
 # Install cligoo from: https://github.com/marcomc/cligoo
 # e.g.: pip install git+https://github.com/marcomc/cligoo.git
-cligoo>=1.0.0
+cligoo>=0.1.1
 
 requests~=2.25.1
 python-dateutil~=2.8.1
@@ -10,4 +10,4 @@ urllib3~=1.26.5
 pyfuse3~=3.2.1
 humanfriendly~=10.0
 humanize~=4.1.0
-trio~=0.21.0
+trio>=0.25.0

@@ -21,9 +21,7 @@ jobs:
         with:
           node-version: "24"
 
-      # ── System dependencies ──────────────────────────────────────────────
-      # pyfuse3 needs libfuse3-dev + meson + ninja to compile its C extension.
-      # git is needed by pip to clone cligoo from GitHub.
+      # ── System dependencies ────────────────────────────────────────────────
       - name: Install system libs
         run: |
           sudo apt-get update -qq
@@ -46,7 +44,7 @@ jobs:
             -gravity Center -draw 'text 0,20 "D"' \
             assets/icon.png
 
-      # ── Bundle Python runtime + all deps ────────────────────────────────
+      # ── Bundle Python runtime + all deps ──────────────────────────────────
       - name: Bundle Python runtime
         run: |
           set -euo pipefail
@@ -59,16 +57,18 @@ jobs:
           DYNLOAD="${PYLIB}/lib-dynload"
           mkdir -p "$SITE" "$DYNLOAD" python/bin
 
-          # ── 1. Python binary ──────────────────────────────────────────────
+          # 1. Python binary
           cp "$(which python3)" python/bin/python3
           chmod +x python/bin/python3
 
-          # ── 2. stdlib → python/lib/pythonX.Y/ ────────────────────────────
+          # 2. stdlib
           STDLIB_SRC=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
           echo "stdlib src: $STDLIB_SRC"
           cp -rT "$STDLIB_SRC" "${PYLIB}/"
 
-          # ── 3. lib-dynload → python/lib/pythonX.Y/lib-dynload/ ───────────
+          # 3. lib-dynload (C stdlib extensions: _sqlite3.so, _ssl.so, etc.)
+          #    These MUST live at $PYTHONHOME/lib/pythonX.Y/lib-dynload/ so
+          #    that CPython's import machinery finds them when PYTHONHOME is set.
           DYNLOAD_SRC="/usr/lib/python${PYVER}/lib-dynload"
           if [ ! -d "$DYNLOAD_SRC" ]; then
             PLATSTDLIB=$(python3 -c 'import sysconfig; print(sysconfig.get_path("platstdlib"))')
@@ -78,10 +78,14 @@ jobs:
           cp -r "${DYNLOAD_SRC}/"* "$DYNLOAD/"
           echo "  -> $(ls $DYNLOAD | wc -l) C extensions bundled"
 
-          # ── 4. pip — upgrade toolchain ────────────────────────────────────
+          # Verify _sqlite3 is present (it is always needed at runtime)
+          ls "$DYNLOAD"/_sqlite3*.so 2>/dev/null || \
+            { echo "ERROR: _sqlite3.so missing from lib-dynload"; exit 1; }
+
+          # 4. pip toolchain
           pip3 install --upgrade pip setuptools wheel
 
-          # ── 5. pip — core deps (pyfuse3 built from source) ────────────────
+          # 5. Python deps
           pip3 install \
             --target="$SITE" \
             "pyfuse3>=3.2.1" \
@@ -92,17 +96,11 @@ jobs:
             "humanize>=4.1.0" \
             "trio>=0.21.0"
 
-          # ── 6. cligoo — the Degoo API client library ──────────────────────
-          # cligoo is authored by marcomc and lives at:
-          #   https://github.com/marcomc/cligoo
-          # It is NOT on PyPI (at least not under that name/version), so we
-          # install directly from the upstream git repository.
-          #
-          # Install chain:
-          #   a) PyPI  (succeeds once/if marcomc publishes a release)
-          #   b) git source from marcomc/cligoo@main
-          #
-          # git config identity is required by some pip git backends.
+          # Verify pyfuse3 .so landed in site-packages and imports correctly
+          PYTHONPATH="$SITE" python3 -c \
+            'import pyfuse3; print("pyfuse3 OK:", pyfuse3.__file__)'
+
+          # 6. cligoo
           git config --global user.email "ci@build" || true
           git config --global user.name  "CI"        || true
 
@@ -110,11 +108,12 @@ jobs:
           pip3 install --target="$SITE" \
             "git+https://github.com/marcomc/cligoo.git@main"
 
-          # Verify cligoo installed correctly
           PYTHONPATH="$SITE" python3 -c \
             'from cligoo.api import DegooClient; print("cligoo OK")'
 
-          # ── 7. Shared libraries (libfuse3, libpython, libssl) ─────────────
+          # 7. Shared libraries that the bundled .so files dlopen() at runtime.
+          #    We copy the real files AND their symlinks so ldconfig-style
+          #    soname resolution works inside the AppImage sandbox.
           mkdir -p python/shlib
           for pat in \
             "/usr/lib/x86_64-linux-gnu/libfuse3.so*" \
@@ -124,7 +123,9 @@ jobs:
             "/usr/lib/x86_64-linux-gnu/libssl.so*" \
             "/lib/x86_64-linux-gnu/libssl.so*" \
             "/usr/lib/x86_64-linux-gnu/libcrypto.so*" \
-            "/lib/x86_64-linux-gnu/libcrypto.so*"; do
+            "/lib/x86_64-linux-gnu/libcrypto.so*" \
+            "/usr/lib/x86_64-linux-gnu/libsqlite3.so*" \
+            "/lib/x86_64-linux-gnu/libsqlite3.so*"; do
             for f in $pat; do
               [ -e "$f" ] && cp -Pv "$f" python/shlib/ 2>/dev/null || true
             done
@@ -132,24 +133,37 @@ jobs:
 
           echo "Bundle size: $(du -sh python | cut -f1)"
 
-      # ── Shell launcher: sets PYTHONHOME *before* exec'ing Python ──────────
+      # ── Shell launcher ────────────────────────────────────────────────────
+      # Critical rules:
+      #   - Use printf, not heredoc, to avoid variable-expansion surprises
+      #     when PYVER contains dots (heredoc delimiter matching).
+      #   - PYTHONHOME must point at the python/ subtree so CPython finds
+      #     its stdlib at $PYTHONHOME/lib/pythonX.Y/ AND lib-dynload under it.
+      #   - PYTHONPATH adds site-packages on top of PYTHONHOME so pip-installed
+      #     packages (pyfuse3, cligoo, trio, ...) are importable.
+      #   - LD_LIBRARY_PATH prepends shlib/ so libfuse3/libpython/libssl are
+      #     found before system libs (which may be the wrong version).
       - name: Write Python launcher script
         run: |
           PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 
-          cat > python/bin/degoo_python.sh << LAUNCHER
-          #!/bin/sh
-          SELF="\$(cd "\$(dirname "\$0")" && pwd)"
-          PYBASE="\$(cd "\$SELF/.." && pwd)"
-          export PYTHONHOME="\$PYBASE"
-          export PYTHONPATH="\$PYBASE/lib/python${PYVER}/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
-          export LD_LIBRARY_PATH="\$PYBASE/shlib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-          exec "\$SELF/python3" "\$@"
-          LAUNCHER
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'SELF="$(cd "$(dirname "$0")" && pwd)"' \
+            'PYBASE="$(cd "$SELF/.." && pwd)"' \
+            'export PYTHONHOME="$PYBASE"' \
+            "export PYTHONPATH=\"\$PYBASE/lib/python${PYVER}/site-packages\${PYTHONPATH:+:\$PYTHONPATH}\"" \
+            'export LD_LIBRARY_PATH="$PYBASE/shlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+            'exec "$SELF/python3" "$@"' \
+            > python/bin/degoo_python.sh
 
           chmod +x python/bin/degoo_python.sh
           echo "--- Launcher contents ---"
           cat python/bin/degoo_python.sh
+
+          # Smoke-test: the launcher must be able to import all critical modules
+          python/bin/degoo_python.sh -c \
+            'import sqlite3, pyfuse3; from cligoo.api import DegooClient; print("All imports OK")'
 
       # ── Stage fuse_degoo.py ───────────────────────────────────────────────
       - name: Stage backend script

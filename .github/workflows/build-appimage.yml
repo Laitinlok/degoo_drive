@@ -20,16 +20,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "24"
-          # No cache: npm — we use npm install (not ci) so no lockfile required
-
-      - name: Install dependencies
-        run: npm install
 
       - name: Install system libs
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            rpm fakeroot dpkg libarchive-tools imagemagick
+            rpm fakeroot dpkg libarchive-tools imagemagick \
+            libfuse3-dev libfuse3-3 fuse3 \
+            python3 python3-dev python3-pip python3-venv \
+            pkg-config
+
+      - name: Install Node dependencies
+        run: npm install
 
       - name: Generate icon
         run: |
@@ -39,6 +41,69 @@ jobs:
             -fill white -font Liberation-Sans-Bold -pointsize 300 \
             -gravity Center -draw 'text 0,20 "D"' \
             assets/icon.png
+
+      # ── Bundle Python runtime + all deps into python/ ──────────────────────
+      - name: Bundle Python deps (including pyfuse3)
+        run: |
+          PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+          echo "Python version: $PYVER"
+
+          # Install deps into a local target dir that will be packed into AppImage
+          mkdir -p python/lib/python${PYVER}/site-packages
+          pip3 install \
+            --target=python/lib/python${PYVER}/site-packages \
+            --no-build-isolation \
+            "pyfuse3>=3.2.1" \
+            "requests>=2.25.1" \
+            "python-dateutil>=2.8.1" \
+            "urllib3>=1.26.5" \
+            "humanfriendly>=10.0" \
+            "humanize>=4.1.0" \
+            "trio>=0.21.0" \
+            "cligoo>=1.0.0" || \
+          pip3 install \
+            --target=python/lib/python${PYVER}/site-packages \
+            --no-build-isolation \
+            "pyfuse3>=3.2.1" \
+            "requests>=2.25.1" \
+            "python-dateutil>=2.8.1" \
+            "urllib3>=1.26.5" \
+            "humanfriendly>=10.0" \
+            "humanize>=4.1.0" \
+            "trio>=0.21.0"
+
+          # Copy python3 binary
+          mkdir -p python/bin
+          cp $(which python3) python/bin/python3
+
+          # Copy libfuse3 shared library so pyfuse3 .so can dlopen it
+          mkdir -p python/lib
+          for lib in /usr/lib/x86_64-linux-gnu/libfuse3.so* \
+                     /lib/x86_64-linux-gnu/libfuse3.so*; do
+            [ -e "$lib" ] && cp -P "$lib" python/lib/ && echo "Copied $lib"
+          done
+
+          # Also bundle libpython shared lib
+          for lib in /usr/lib/x86_64-linux-gnu/libpython${PYVER}*.so* \
+                     /lib/x86_64-linux-gnu/libpython${PYVER}*.so*; do
+            [ -e "$lib" ] && cp -P "$lib" python/lib/ && echo "Copied $lib"
+          done
+
+          # Standard library modules needed at runtime
+          STDLIB=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
+          cp -r "$STDLIB" python/stdlib
+
+          echo "Python bundle size: $(du -sh python | cut -f1)"
+
+      # ── Copy backend script ────────────────────────────────────────────────
+      - name: Stage backend script
+        run: |
+          # fuse_degoo.py lives on feat/cligoo-backend; if merging branches
+          # it will already be present. Otherwise fetch it.
+          if [ ! -f fuse_degoo.py ]; then
+            git fetch origin feat/cligoo-backend
+            git checkout origin/feat/cligoo-backend -- fuse_degoo.py
+          fi
 
       - name: Build AppImage + Deb
         env:

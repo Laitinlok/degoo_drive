@@ -25,8 +25,14 @@
     "appId": "com.degoo.drive",
     "productName": "Degoo Drive",
     "directories": { "output": "dist" },
-    "files": ["src/**/*", "assets/**/*"],
-    "extraResources": [{ "from": "fuse_degoo.py", "to": "fuse_degoo.py" }],
+    "files": [
+      "src/**/*",
+      "assets/**/*"
+    ],
+    "extraResources": [
+      { "from": "fuse_degoo.py",  "to": "fuse_degoo.py" },
+      { "from": "python/",        "to": "python/" }
+    ],
     "linux": {
       "target": ["AppImage", "deb"],
       "category": "Network",

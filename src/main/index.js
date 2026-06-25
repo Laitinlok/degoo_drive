@@ -24,11 +24,47 @@ const store = new Store({
 let tray = null, settingsWin = null, mountProc = null, status = 'stopped';
 const LOG_FILE = path.join(app.getPath('userData'), 'degoo-drive.log');
 
+// ── Resolve bundled Python runtime ──────────────────────────────────────────
+const RESOURCES = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..', '..');
+const PYTHON_DIR = path.join(RESOURCES, 'python');
+const PYTHON_BIN = (() => {
+  const bundled = path.join(PYTHON_DIR, 'bin', 'python3');
+  if (fs.existsSync(bundled)) return bundled;
+  return 'python3'; // dev fallback
+})();
 const SCRIPT = (() => {
-  const packed = path.join(process.resourcesPath, 'fuse_degoo.py');
+  const packed = path.join(RESOURCES, 'fuse_degoo.py');
   if (fs.existsSync(packed)) return packed;
   return path.join(__dirname, '..', '..', 'fuse_degoo.py');
 })();
+
+// ── Site-packages path (matches pip --target layout) ────────────────────────
+function getPythonEnv() {
+  const sitePackages = (() => {
+    // Find python version from bundled python
+    try {
+      const ver = cp.execSync(`"${PYTHON_BIN}" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"`,
+        { encoding: 'utf8' }).trim();
+      return path.join(PYTHON_DIR, 'lib', `python${ver}`, 'site-packages');
+    } catch { return ''; }
+  })();
+
+  const env = { ...process.env };
+  if (sitePackages) {
+    env.PYTHONPATH = sitePackages + (process.env.PYTHONPATH ? ':' + process.env.PYTHONPATH : '');
+  }
+  // Bundled shared libs (libfuse3, libpython)
+  const libDir = path.join(PYTHON_DIR, 'lib');
+  if (fs.existsSync(libDir)) {
+    env.LD_LIBRARY_PATH = libDir + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : '');
+  }
+  // Stdlib
+  const stdlib = path.join(PYTHON_DIR, 'stdlib');
+  if (fs.existsSync(stdlib)) {
+    env.PYTHONPATH = (env.PYTHONPATH ? env.PYTHONPATH + ':' : '') + stdlib;
+  }
+  return env;
+}
 
 function makeIcon(color, letter = 'D') {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">
@@ -46,7 +82,7 @@ const ICONS = {
 function openSettings() {
   if (settingsWin) { settingsWin.focus(); return; }
   settingsWin = new BrowserWindow({
-    width: 520, height: 700, resizable: false, title: 'Degoo Drive — Settings',
+    width: 520, height: 700, resizable: false, title: 'Degoo Drive \u2014 Settings',
     webPreferences: {
       nodeIntegration: false, contextIsolation: true,
       preload: path.join(__dirname, 'preload.js')
@@ -75,7 +111,11 @@ function startMount() {
     '--chunk-max-age', String(s.chunkMaxAge), '--allow-other',
   ];
   const log = fs.createWriteStream(LOG_FILE, { flags: 'a' });
-  mountProc = cp.spawn('python3', args, { detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
+  mountProc = cp.spawn(PYTHON_BIN, args, {
+    detached: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: getPythonEnv(),
+  });
   mountProc.stdout.pipe(log);
   mountProc.stderr.pipe(log);
   mountProc.on('spawn', () => setStatus('running'));
@@ -91,7 +131,7 @@ function stopMount() {
 function setStatus(s) {
   status = s;
   updateTray();
-  const msgs = { running: 'Mount started successfully.', error: 'Mount failed — check logs.' };
+  const msgs = { running: 'Mount started successfully.', error: 'Mount failed \u2014 check logs.' };
   if (msgs[s] && Notification.isSupported()) new Notification({ title: 'Degoo Drive', body: msgs[s] }).show();
   if (settingsWin) settingsWin.webContents.send('status', status);
 }
@@ -99,18 +139,18 @@ function setStatus(s) {
 function updateTray() {
   if (!tray) return;
   tray.setImage(ICONS[status]());
-  tray.setToolTip(`Degoo Drive — ${status}`);
+  tray.setToolTip(`Degoo Drive \u2014 ${status}`);
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: `● ${status.charAt(0).toUpperCase() + status.slice(1)}`, enabled: false },
+    { label: `\u25cf ${status.charAt(0).toUpperCase() + status.slice(1)}`, enabled: false },
     { type: 'separator' },
-    { label: '▶  Start mount',  enabled: status !== 'running', click: startMount },
-    { label: '■  Stop mount',   enabled: status === 'running', click: stopMount },
+    { label: '\u25b6  Start mount',  enabled: status !== 'running', click: startMount },
+    { label: '\u25a0  Stop mount',   enabled: status === 'running', click: stopMount },
     { type: 'separator' },
-    { label: '📂  Open folder', click: () => shell.openPath(store.get('mountpoint')) },
-    { label: '⚙  Settings…',   click: openSettings },
-    { label: '📋  View logs…',  click: () => shell.openPath(LOG_FILE) },
+    { label: '\ud83d\udcc2  Open folder', click: () => shell.openPath(store.get('mountpoint')) },
+    { label: '\u2699  Settings\u2026',   click: openSettings },
+    { label: '\ud83d\udccb  View logs\u2026',  click: () => shell.openPath(LOG_FILE) },
     { type: 'separator' },
-    { label: '✕  Quit', click: () => { stopMount(); app.quit(); } },
+    { label: '\u2715  Quit', click: () => { stopMount(); app.quit(); } },
   ]));
 }
 
@@ -129,7 +169,7 @@ ipcMain.handle('browse-folder', async () => {
 app.whenReady().then(() => {
   app.setAppUserModelId('com.degoo.drive');
   tray = new Tray(ICONS.stopped());
-  tray.setToolTip('Degoo Drive — stopped');
+  tray.setToolTip('Degoo Drive \u2014 stopped');
   tray.on('double-click', () => shell.openPath(store.get('mountpoint')));
   updateTray();
   if (store.get('startOnLaunch') && store.get('email')) setTimeout(startMount, 1000);

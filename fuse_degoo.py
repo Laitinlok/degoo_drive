@@ -727,10 +727,15 @@ class Operations(pyfuse3.Operations):
 
     async def unlink(self, inode_p, name, ctx):
         name = fsdecode(name)
+        # fullpath=True: we need the complete FilePath so _get_degoo_id()
+        # looks up by FilePath (contains '/') instead of just Name, which
+        # prevents resolving to the wrong file when two items share a name.
         parent = self._inode_to_path(inode_p, fullpath=True)
-        path = parent + '/' + name
+        path = parent.rstrip('/') + '/' + name
 
         file_id = self._get_degoo_id(path)
+        if file_id is None:
+            raise FUSEError(errno.ENOENT)
         _client.delete([str(file_id)])
         if file_id in degoo_tree_content:
             del degoo_tree_content[file_id]
@@ -742,10 +747,14 @@ class Operations(pyfuse3.Operations):
 
     async def rmdir(self, inode_p, name, ctx):
         name = fsdecode(name)
+        # fullpath=True: same reason as unlink — we need the absolute path
+        # so _get_degoo_id() can resolve by FilePath, not just Name.
         parent = self._inode_to_path(inode_p, fullpath=True)
-        path = parent + '/' + name
+        path = parent.rstrip('/') + '/' + name
 
         file_id = self._get_degoo_id(path)
+        if file_id is None:
+            raise FUSEError(errno.ENOENT)
         _client.delete([str(file_id)])
         if file_id in degoo_tree_content:
             del degoo_tree_content[file_id]
@@ -773,7 +782,7 @@ class Operations(pyfuse3.Operations):
         name_new = fsdecode(name_new)
 
         path = self._inode_to_path(inode_p_old, fullpath=True)
-        path_old = path + '/' + name_old
+        path_old = path.rstrip('/') + '/' + name_old
 
         inode = self._get_degoo_id(path_old)
 
@@ -806,7 +815,7 @@ class Operations(pyfuse3.Operations):
                 entry['ParentID'] = inode_p_new
                 degoo_tree_content[inode] = entry
 
-        path_new = self._inode_to_path(inode_p_new, fullpath=True) + '/' + name_new
+        path_new = self._inode_to_path(inode_p_new, fullpath=True).rstrip('/') + '/' + name_new
 
         val = self._inode_path_map[inode]
         if isinstance(val, set):
@@ -819,12 +828,26 @@ class Operations(pyfuse3.Operations):
 
     async def mkdir(self, inode_p, name, mode, ctx):
         name = fsdecode(name)
-        base_path = self._inode_to_path(inode_p)
+        # fullpath=True is critical here: without it _inode_to_path() strips
+        # everything before the last '/' and returns only the directory name
+        # (e.g. "Music").  _get_degoo_id() then falls into the Name-based
+        # lookup branch (no '/' in the string) and can match the wrong entry
+        # or return None, so _client.mkdir() gets a bad parent_id and the
+        # Degoo API responds with "Error creating entries!".
+        base_path = self._inode_to_path(inode_p, fullpath=True)
         element_id = self._get_degoo_id(base_path)
 
-        log.debug('Creating directory \'%s\' in Degoo path \'%s\'', name, base_path)
+        if element_id is None:
+            log.debug('mkdir: cannot resolve parent inode %d (path=%s)', inode_p, base_path)
+            raise FUSEError(errno.ENOENT)
 
-        _client.mkdir(name, str(element_id))
+        log.debug("Creating directory '%s' in Degoo path '%s' (id=%s)", name, base_path, element_id)
+
+        try:
+            _client.mkdir(name, str(element_id))
+        except DegooAPIError as exc:
+            log.debug('mkdir API error for %s in %s: %s', name, base_path, exc)
+            raise FUSEError(errno.EIO)
 
         new_dir_item = _client.resolve_path_under(str(element_id), name)
         if not new_dir_item:

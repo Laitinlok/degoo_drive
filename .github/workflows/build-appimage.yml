@@ -21,9 +21,9 @@ jobs:
         with:
           node-version: "24"
 
-      # ── System dependencies ────────────────────────────────────────────
+      # ── System dependencies ──────────────────────────────────────────────
       # pyfuse3 needs libfuse3-dev + meson + ninja to compile its C extension.
-      # Without these pip will fail to build the wheel.
+      # git is needed by pip to clone cligoo from GitHub.
       - name: Install system libs
         run: |
           sudo apt-get update -qq
@@ -32,7 +32,7 @@ jobs:
             libfuse3-dev libfuse3-3 fuse3 \
             python3 python3-dev python3-pip python3-venv \
             libssl-dev libsqlite3-dev pkg-config \
-            meson ninja-build build-essential
+            meson ninja-build build-essential git
 
       - name: Install Node dependencies
         run: npm install
@@ -46,7 +46,7 @@ jobs:
             -gravity Center -draw 'text 0,20 "D"' \
             assets/icon.png
 
-      # ── Bundle Python runtime + all deps ──────────────────────────────
+      # ── Bundle Python runtime + all deps ────────────────────────────────
       - name: Bundle Python runtime
         run: |
           set -euo pipefail
@@ -54,44 +54,23 @@ jobs:
           PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
           echo "Python version: $PYVER"
 
-          # ── Directory layout expected by CPython when PYTHONHOME=python/ ──
-          #
-          #   python/
-          #     bin/python3               <- interpreter binary
-          #     lib/
-          #       pythonX.Y/
-          #         lib-dynload/          <- _sqlite3.so, _ssl.so … (C exts)
-          #         site-packages/        <- pip deps: pyfuse3, cligoo, trio …
-          #     lib/pythonX.Y/            <- ALSO the stdlib location CPython
-          #       encodings/              <- searches when PYTHONHOME is set
-          #       … (rest of stdlib)
-          #
-          # CPython resolves stdlib as  $PYTHONHOME/lib/pythonX.Y/
-          # lib-dynload as              $PYTHONHOME/lib/pythonX.Y/lib-dynload/
-          # site-packages is on PYTHONPATH explicitly.
-
           PYLIB="python/lib/python${PYVER}"
           SITE="${PYLIB}/site-packages"
           DYNLOAD="${PYLIB}/lib-dynload"
           mkdir -p "$SITE" "$DYNLOAD" python/bin
 
-          # ── 1. Python binary ──────────────────────────────────────────
+          # ── 1. Python binary ──────────────────────────────────────────────
           cp "$(which python3)" python/bin/python3
           chmod +x python/bin/python3
 
-          # ── 2. stdlib → python/lib/pythonX.Y/ ─────────────────────────
-          # sysconfig gives us the installed stdlib path (e.g. /usr/lib/python3.10)
+          # ── 2. stdlib → python/lib/pythonX.Y/ ────────────────────────────
           STDLIB_SRC=$(python3 -c 'import sysconfig; print(sysconfig.get_path("stdlib"))')
           echo "stdlib src: $STDLIB_SRC"
-          # Copy stdlib contents directly into python/lib/pythonX.Y/
-          # (not into a nested subdir) so PYTHONHOME resolution works.
           cp -rT "$STDLIB_SRC" "${PYLIB}/"
 
-          # ── 3. lib-dynload → python/lib/pythonX.Y/lib-dynload/ ─────────
-          # Ubuntu 22.04 places lib-dynload at /usr/lib/python3.X/lib-dynload
+          # ── 3. lib-dynload → python/lib/pythonX.Y/lib-dynload/ ───────────
           DYNLOAD_SRC="/usr/lib/python${PYVER}/lib-dynload"
           if [ ! -d "$DYNLOAD_SRC" ]; then
-            # Fallback: derive from platstdlib
             PLATSTDLIB=$(python3 -c 'import sysconfig; print(sysconfig.get_path("platstdlib"))')
             DYNLOAD_SRC="${PLATSTDLIB}/lib-dynload"
           fi
@@ -99,12 +78,10 @@ jobs:
           cp -r "${DYNLOAD_SRC}/"* "$DYNLOAD/"
           echo "  -> $(ls $DYNLOAD | wc -l) C extensions bundled"
 
-          # ── 4. pip install all Python deps ─────────────────────────────
-          # Upgrade pip first so it can handle recent wheel formats.
+          # ── 4. pip — upgrade toolchain ────────────────────────────────────
           pip3 install --upgrade pip setuptools wheel
 
-          # pyfuse3 must be built from source (needs libfuse3-dev, meson,
-          # ninja — installed in the system-deps step above).
+          # ── 5. pip — core deps (pyfuse3 built from source) ────────────────
           pip3 install \
             --target="$SITE" \
             "pyfuse3>=3.2.1" \
@@ -115,14 +92,29 @@ jobs:
             "humanize>=4.1.0" \
             "trio>=0.21.0"
 
-          # cligoo: try PyPI first, fall back to git source.
-          pip3 install --target="$SITE" "cligoo>=0.1.1" || \
-          pip3 install --target="$SITE" \
-            "git+https://github.com/Laitinlok/cligoo.git@main#egg=cligoo" || \
-          pip3 install --target="$SITE" \
-            "git+https://github.com/Laitinlok/degoo_drive.git@feat/cligoo-backend#subdirectory=cligoo"
+          # ── 6. cligoo — the Degoo API client library ──────────────────────
+          # cligoo is authored by marcomc and lives at:
+          #   https://github.com/marcomc/cligoo
+          # It is NOT on PyPI (at least not under that name/version), so we
+          # install directly from the upstream git repository.
+          #
+          # Install chain:
+          #   a) PyPI  (succeeds once/if marcomc publishes a release)
+          #   b) git source from marcomc/cligoo@main
+          #
+          # git config identity is required by some pip git backends.
+          git config --global user.email "ci@build" || true
+          git config --global user.name  "CI"        || true
 
-          # ── 5. Shared libraries (libfuse3, libpython, libssl) ───────────
+          pip3 install --target="$SITE" "cligoo" 2>/dev/null || \
+          pip3 install --target="$SITE" \
+            "git+https://github.com/marcomc/cligoo.git@main"
+
+          # Verify cligoo installed correctly
+          PYTHONPATH="$SITE" python3 -c \
+            'from cligoo.api import DegooClient; print("cligoo OK")'
+
+          # ── 7. Shared libraries (libfuse3, libpython, libssl) ─────────────
           mkdir -p python/shlib
           for pat in \
             "/usr/lib/x86_64-linux-gnu/libfuse3.so*" \
@@ -140,35 +132,26 @@ jobs:
 
           echo "Bundle size: $(du -sh python | cut -f1)"
 
-      # ── Write the shell launcher that sets env BEFORE exec'ing Python ──
-      # This is the critical fix: PYTHONHOME must be in the environment
-      # before the interpreter binary loads, not passed via spawn env
-      # from Node — on some systems the AppImage squashfs mount means
-      # the env vars set by Node's child_process.spawn don't reach the
-      # dynamic linker early enough.
+      # ── Shell launcher: sets PYTHONHOME *before* exec'ing Python ──────────
       - name: Write Python launcher script
         run: |
-          cat > python/bin/degoo_python.sh << 'LAUNCHER'
-          #!/bin/sh
-          # Resolve the directory this script lives in, even after symlinks.
-          SELF="$(cd "$(dirname "$0")" && pwd)"
-          PYBASE="$(cd "$SELF/.." && pwd)"
-
-          export PYTHONHOME="$PYBASE"
-          export PYTHONPATH="$PYBASE/lib/python__PYVER__/site-packages${PYTHONPATH:+:$PYTHONPATH}"
-          export LD_LIBRARY_PATH="$PYBASE/shlib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-          exec "$SELF/python3" "$@"
-          LAUNCHER
-          chmod +x python/bin/degoo_python.sh
-
-          # Stamp the real python version into the launcher
           PYVER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-          sed -i "s/__PYVER__/${PYVER}/g" python/bin/degoo_python.sh
-          echo "Launcher:"
+
+          cat > python/bin/degoo_python.sh << LAUNCHER
+          #!/bin/sh
+          SELF="\$(cd "\$(dirname "\$0")" && pwd)"
+          PYBASE="\$(cd "\$SELF/.." && pwd)"
+          export PYTHONHOME="\$PYBASE"
+          export PYTHONPATH="\$PYBASE/lib/python${PYVER}/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
+          export LD_LIBRARY_PATH="\$PYBASE/shlib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+          exec "\$SELF/python3" "\$@"
+          LAUNCHER
+
+          chmod +x python/bin/degoo_python.sh
+          echo "--- Launcher contents ---"
           cat python/bin/degoo_python.sh
 
-      # ── Stage fuse_degoo.py ────────────────────────────────────────────
+      # ── Stage fuse_degoo.py ───────────────────────────────────────────────
       - name: Stage backend script
         run: |
           if [ ! -f fuse_degoo.py ]; then

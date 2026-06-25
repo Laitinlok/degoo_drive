@@ -7,6 +7,10 @@ backend instead of the bundled degoo/__init__.py module.
 Directory tree is now persisted in a SQLite database so the FUSE mount
 starts instantly on subsequent runs without a full API rescan.
 
+Download chunks are also persisted in a dedicated cache directory tracked
+by the same SQLite database, so files do not need to be re-downloaded
+after a restart or reboot.
+
 Original degoo_drive: https://github.com/Laitinlok/degoo_drive
 cligoo API:           https://github.com/marcomc/cligoo
 """
@@ -56,15 +60,20 @@ faulthandler.enable()
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SQLite-backed tree cache
+# Default paths
 # ---------------------------------------------------------------------------
 
-_DEFAULT_DB_PATH = os.path.join(
+_CACHE_BASE = os.path.join(
     os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')),
     'degoo_drive',
-    'tree_cache.db',
 )
+_DEFAULT_DB_PATH = os.path.join(_CACHE_BASE, 'tree_cache.db')
+_DEFAULT_CHUNK_CACHE_DIR = os.path.join(_CACHE_BASE, 'chunks')
 
+
+# ---------------------------------------------------------------------------
+# SQLite-backed tree cache
+# ---------------------------------------------------------------------------
 
 class TreeCache:
     """Thread-safe, SQLite-backed mapping that replaces the old `degoo_tree_content` dict.
@@ -166,8 +175,180 @@ class TreeCache:
         return row[0] if row else 0
 
 
-# Global tree cache – initialised in main() once --db-path is known.
+# ---------------------------------------------------------------------------
+# SQLite-backed chunk cache
+# ---------------------------------------------------------------------------
+
+class ChunkCache:
+    """Persistent cache for downloaded file chunks.
+
+    Chunk bytes are stored as regular files in *cache_dir* so they can be
+    memory-mapped and read without copying.  The SQLite database (shared with
+    TreeCache) tracks each chunk's path, size, and last-accessed timestamp so
+    the maintenance thread can evict stale entries without scanning the
+    filesystem.
+
+    Schema (``chunks`` table)::
+
+        item_id      INTEGER  — Degoo item/file ID
+        part         INTEGER  — zero-based chunk index
+        path         TEXT     — absolute path to the chunk file on disk
+        size         INTEGER  — byte length of the chunk
+        last_accessed INTEGER — Unix timestamp (seconds) of last read
+        PRIMARY KEY (item_id, part)
+
+    Thread safety
+    -------------
+    Same one-connection-per-thread strategy as TreeCache.
+    """
+
+    def __init__(self, db_path: str, cache_dir: str = _DEFAULT_CHUNK_CACHE_DIR) -> None:
+        self._db_path = db_path
+        self._cache_dir = cache_dir
+        self._local = threading.local()
+        os.makedirs(cache_dir, exist_ok=True)
+        conn = self._conn()
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS chunks ('
+            '  item_id      INTEGER NOT NULL,'
+            '  part         INTEGER NOT NULL,'
+            '  path         TEXT    NOT NULL,'
+            '  size         INTEGER NOT NULL DEFAULT 0,'
+            '  last_accessed INTEGER NOT NULL DEFAULT 0,'
+            '  PRIMARY KEY (item_id, part)'
+            ')'
+        )
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.commit()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _conn(self) -> sqlite3.Connection:
+        if not getattr(self._local, 'conn', None):
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            self._local.conn = conn
+        return self._local.conn
+
+    def _stable_path(self, item_id: int, part: int) -> str:
+        """Return the deterministic filesystem path for a chunk.
+
+        Uses ``<item_id>_<part>.chunk`` so the same chunk always maps to the
+        same file regardless of the Degoo filename (avoids collisions between
+        two files that share the same display name).
+        """
+        return os.path.join(self._cache_dir, f'{item_id}_{part}.chunk')
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def chunk_path(self, item_id: int, part: int) -> str:
+        """Return the path where this chunk should be (or is already) stored."""
+        row = self._conn().execute(
+            'SELECT path FROM chunks WHERE item_id=? AND part=?',
+            (item_id, part),
+        ).fetchone()
+        if row:
+            return row[0]
+        # Not registered yet — return the stable computed path.
+        return self._stable_path(item_id, part)
+
+    def exists(self, item_id: int, part: int) -> bool:
+        """Return True if the chunk is registered in the DB *and* the file exists on disk."""
+        row = self._conn().execute(
+            'SELECT path FROM chunks WHERE item_id=? AND part=?',
+            (item_id, part),
+        ).fetchone()
+        if row is None:
+            return False
+        if not os.path.isfile(row[0]):
+            # DB row is stale — clean it up.
+            self._conn().execute(
+                'DELETE FROM chunks WHERE item_id=? AND part=?', (item_id, part)
+            )
+            self._conn().commit()
+            return False
+        return True
+
+    def touch(self, item_id: int, part: int) -> None:
+        """Update the last_accessed timestamp for a chunk (called on every read)."""
+        self._conn().execute(
+            'UPDATE chunks SET last_accessed=? WHERE item_id=? AND part=?',
+            (int(time.time()), item_id, part),
+        )
+        self._conn().commit()
+
+    def register(self, item_id: int, part: int, path: str, size: int) -> None:
+        """Record a newly downloaded chunk in the database."""
+        conn = self._conn()
+        conn.execute(
+            'INSERT OR REPLACE INTO chunks (item_id, part, path, size, last_accessed) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (item_id, part, path, size, int(time.time())),
+        )
+        conn.commit()
+
+    def evict_file(self, item_id: int) -> None:
+        """Remove all cached chunks for *item_id* from disk and the DB."""
+        conn = self._conn()
+        rows = conn.execute(
+            'SELECT path FROM chunks WHERE item_id=?', (item_id,)
+        ).fetchall()
+        for (path,) in rows:
+            try:
+                os.remove(path)
+                log.debug('ChunkCache: evicted %s', path)
+            except FileNotFoundError:
+                pass
+        conn.execute('DELETE FROM chunks WHERE item_id=?', (item_id,))
+        conn.commit()
+
+    def evict_stale(self, max_age_seconds: int = 3600) -> int:
+        """Delete chunks not accessed within *max_age_seconds*.
+
+        Returns the number of chunks evicted.
+        """
+        cutoff = int(time.time()) - max_age_seconds
+        conn = self._conn()
+        rows = conn.execute(
+            'SELECT item_id, part, path FROM chunks WHERE last_accessed < ?',
+            (cutoff,),
+        ).fetchall()
+        for item_id, part, path in rows:
+            try:
+                os.remove(path)
+                log.debug('ChunkCache: evicted stale chunk %s', path)
+            except FileNotFoundError:
+                pass
+        if rows:
+            conn.execute('DELETE FROM chunks WHERE last_accessed < ?', (cutoff,))
+            conn.commit()
+        return len(rows)
+
+    def evict_all(self) -> None:
+        """Remove every cached chunk (used during full tree refresh)."""
+        conn = self._conn()
+        rows = conn.execute('SELECT path FROM chunks').fetchall()
+        for (path,) in rows:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        conn.execute('DELETE FROM chunks')
+        conn.commit()
+
+    def __len__(self) -> int:
+        row = self._conn().execute('SELECT COUNT(*) FROM chunks').fetchone()
+        return row[0] if row else 0
+
+
+# Global caches – initialised in main() once CLI args are known.
 tree_cache: TreeCache = None  # type: ignore[assignment]
+chunk_cache: ChunkCache = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Legacy alias so all existing code referencing `degoo_tree_content` keeps
@@ -282,6 +463,7 @@ class Operations(pyfuse3.Operations):
 
     def __init__(self, source, cache_size, flood_sleep_time, flood_time_to_check, flood_max_requests,
                  enable_flood_control, change_hostname, mode, plex_split_file,
+                 chunk_cache: ChunkCache,
                  download_threads=8, subchunk_connections=_DEFAULT_SUBCHUNK_CONNECTIONS,
                  lookahead_chunks=2):
         super().__init__()
@@ -302,6 +484,7 @@ class Operations(pyfuse3.Operations):
         self._change_hostname = change_hostname
         self._mode = mode
         self._plex_split_file = plex_split_file
+        self._chunk_cache = chunk_cache
         self._subchunk_connections = subchunk_connections
         # Number of chunks to pre-fetch ahead of the current read position.
         self._lookahead_chunks = max(1, lookahead_chunks)
@@ -551,6 +734,8 @@ class Operations(pyfuse3.Operations):
         _client.delete([str(file_id)])
         if file_id in degoo_tree_content:
             del degoo_tree_content[file_id]
+        # Evict any cached chunks for this file
+        self._chunk_cache.evict_file(file_id)
 
         if file_id in self._lookup_cnt:
             self._forget_path(file_id, path)
@@ -564,6 +749,7 @@ class Operations(pyfuse3.Operations):
         _client.delete([str(file_id)])
         if file_id in degoo_tree_content:
             del degoo_tree_content[file_id]
+        self._chunk_cache.evict_file(file_id)
 
         if file_id in self._lookup_cnt:
             self._forget_path(file_id, path)
@@ -678,27 +864,29 @@ class Operations(pyfuse3.Operations):
         path_file = self._inode_to_path(fd, fullpath=True)
 
         degoo_file_size = self._get_degoo_element_by_id(fd)['Size']
+        item_id = self._get_degoo_id(path_file)
 
         first_file_part = offset // self._cache_size
-        temp_filename = self._get_temp_file(path_file, first_file_part)
+        temp_filename = self._chunk_cache.chunk_path(item_id, first_file_part)
 
-        if not os.path.isfile(temp_filename):
+        if not self._chunk_cache.exists(item_id, first_file_part):
             self._check_requests()
             future = self._download_executor.submit(
                 self._cache_file, path_file, first_file_part, degoo_file_size)
             future.result()
+        else:
+            # Chunk already on disk — update access time so it won't be evicted.
+            self._chunk_cache.touch(item_id, first_file_part)
 
         # ---------------------------------------------------------------
         # Multi-chunk lookahead pre-fetch
-        # Pre-fetch the next N chunks asynchronously so they are warm in
-        # the temp directory before the read pointer reaches them.
         # ---------------------------------------------------------------
         for ahead in range(1, self._lookahead_chunks + 1):
             lookahead_part = first_file_part + ahead
             if lookahead_part * self._cache_size >= degoo_file_size:
-                break  # past end of file — nothing to pre-fetch
-            next_temp = self._get_temp_file(path_file, lookahead_part)
-            if next_temp not in caching_file_list and not os.path.isfile(next_temp):
+                break
+            next_temp = self._chunk_cache.chunk_path(item_id, lookahead_part)
+            if next_temp not in caching_file_list and not self._chunk_cache.exists(item_id, lookahead_part):
                 self._check_requests()
                 log.debug('Pre-fetching chunk %d [%s]', lookahead_part, next_temp)
                 caching_file_list.append(next_temp)
@@ -713,7 +901,7 @@ class Operations(pyfuse3.Operations):
         result = (offset // self._cache_size)
         size_to_read = offset + length
         second_file_part = first_file_part + 1
-        next_temp_filename = self._get_temp_file(path_file, second_file_part)
+        next_temp_filename = self._chunk_cache.chunk_path(item_id, second_file_part)
 
         if not os.path.isfile(temp_filename):
             raise pyfuse3.FUSEError(errno.ENOENT)
@@ -733,7 +921,7 @@ class Operations(pyfuse3.Operations):
 
             log.debug('Reading second part from two files. File 2 [%s]', next_temp_filename)
 
-            self._clear_files(path_file, skip_filename=next_temp_filename)
+            self._clear_files(path_file, skip_item_id=item_id, skip_part=second_file_part)
 
             retries = 0
             while next_temp_filename in caching_file_list and retries < 10:
@@ -753,10 +941,13 @@ class Operations(pyfuse3.Operations):
 
     def check_and_split_file(self, path_file):
         if self._plex_split_file:
-            temp_filename = self._get_temp_file(path_file, 0)
+            item_id = self._get_degoo_id(path_file)
+            if item_id is None:
+                return
 
-            if temp_filename not in caching_file_list and not os.path.isfile(temp_filename) \
-                    and self._is_media(path_file):
+            if not self._chunk_cache.exists(item_id, 0) and \
+                    self._chunk_cache.chunk_path(item_id, 0) not in caching_file_list and \
+                    self._is_media(path_file):
 
                 fd_new_part = self._get_next_part_split_file(path_file)
                 if fd_new_part:
@@ -766,6 +957,7 @@ class Operations(pyfuse3.Operations):
 
                     self._check_requests()
 
+                    temp_filename = self._chunk_cache.chunk_path(item_id, 0)
                     caching_file_list.append(temp_filename)
                     pre_cache_parts = [0, 1, last_part]
                     for part in pre_cache_parts:
@@ -851,7 +1043,9 @@ class Operations(pyfuse3.Operations):
                     return
 
             log.debug('Releasing file %s', filename)
-            self._clear_files(filename)
+            # Chunks stay in the persistent cache; only evict from the
+            # in-progress upload temp dir.
+            self._clear_upload_temp(element['FilePath'])
 
             return
         except Exception:
@@ -876,7 +1070,10 @@ class Operations(pyfuse3.Operations):
         source_file = self._inode_to_path(inode, fullpath=True)
 
         del self._inode_path_map[inode]
-        os.remove(source_file)
+        try:
+            os.remove(source_file)
+        except FileNotFoundError:
+            pass
 
     def _check_requests(self):
         if self._enable_flood_control:
@@ -911,6 +1108,10 @@ class Operations(pyfuse3.Operations):
     def _cache_file(self, degoo_path_file: str, file_part: int, degoo_file_size: int) -> None:
         """Download one cache-chunk using multiple parallel sub-range requests.
 
+        The chunk is written to the persistent ChunkCache directory so it
+        survives restarts.  On subsequent mounts the chunk is served directly
+        from disk without contacting the Degoo CDN.
+
         Strategy
         --------
         Degoo's CDN enforces a per-TCP-connection bandwidth cap of ~8 MB/s.
@@ -929,6 +1130,16 @@ class Operations(pyfuse3.Operations):
         if item_id is None:
             log.debug('WARN: No item ID for path %s', degoo_path_file)
             raise pyfuse3.FUSEError(errno.ENOENT)
+
+        # ------------------------------------------------------------------
+        # Fast path: chunk already in persistent cache
+        # ------------------------------------------------------------------
+        if self._chunk_cache.exists(item_id, file_part):
+            chunk_path = self._chunk_cache.chunk_path(item_id, file_part)
+            log.debug('Chunk cache hit: item=%d part=%d [%s]', item_id, file_part, chunk_path)
+            self._chunk_cache.touch(item_id, file_part)
+            caching_file_list_remove(caching_file_list, chunk_path)
+            return
 
         cached = degoo_tree_content.get(item_id, {})
         url = cached.get('URL')
@@ -949,12 +1160,14 @@ class Operations(pyfuse3.Operations):
 
         url_parsed = urlparse(url)
 
+        chunk_path = self._chunk_cache.chunk_path(item_id, file_part)
+
         if not url_parsed.scheme:
-            temp_filename = self._get_temp_file(degoo_path_file, file_part)
-            with open(temp_filename, 'wb') as out:
+            with open(chunk_path, 'wb') as out:
                 out.write(url if isinstance(url, bytes) else url.encode())
-            if temp_filename in caching_file_list:
-                caching_file_list.remove(temp_filename)
+            self._chunk_cache.register(item_id, file_part, chunk_path,
+                                       os.path.getsize(chunk_path))
+            caching_file_list_remove(caching_file_list, chunk_path)
             return
 
         if self._change_hostname and 'degoo' in url_parsed.hostname and url_parsed.hostname != DEGOO_HOSTNAME_EU:
@@ -966,12 +1179,10 @@ class Operations(pyfuse3.Operations):
         chunk_end_inclusive = min(chunk_start + self._cache_size, degoo_file_size) - 1
         chunk_bytes = chunk_end_inclusive - chunk_start + 1
 
-        temp_filename = self._get_temp_file(degoo_path_file, file_part)
-
-        if os.path.isfile(temp_filename):
-            log.debug('Chunk already on disk [%s]', temp_filename)
-            if temp_filename in caching_file_list:
-                caching_file_list.remove(temp_filename)
+        # Double-check: another thread may have finished while we were fetching the URL.
+        if self._chunk_cache.exists(item_id, file_part):
+            self._chunk_cache.touch(item_id, file_part)
+            caching_file_list_remove(caching_file_list, chunk_path)
             return
 
         n = self._subchunk_connections
@@ -1031,32 +1242,35 @@ class Operations(pyfuse3.Operations):
                     except Exception as exc:
                         log.debug(
                             'Sub-range [%d-%d] failed for [%s]: %s',
-                            s, futures[fut][1], temp_filename, exc
+                            s, futures[fut][1], chunk_path, exc
                         )
                         raise
 
             # Reassemble in order and write atomically
             assembled = b''.join(results[s] for s, _ in ranges)
-            tmp_write = temp_filename + '.tmp'
+            tmp_write = chunk_path + '.tmp'
             with open(tmp_write, 'wb') as out:
                 out.write(assembled)
-            os.replace(tmp_write, temp_filename)  # atomic on POSIX
+            os.replace(tmp_write, chunk_path)  # atomic on POSIX
 
-            log.debug('Downloaded chunk [%s] (%d bytes)', temp_filename, len(assembled))
+            # Register in DB so future mounts find it instantly.
+            self._chunk_cache.register(item_id, file_part, chunk_path, len(assembled))
+
+            log.debug('Downloaded + cached chunk [%s] (%d bytes)', chunk_path, len(assembled))
 
         except Exception as exc:
-            log.debug('Error downloading chunk [%s]: %s', temp_filename, exc)
+            log.debug('Error downloading chunk [%s]: %s', chunk_path, exc)
             # Clean up any partial file so a retry will re-attempt
-            for leftover in (temp_filename, temp_filename + '.tmp'):
+            for leftover in (chunk_path, chunk_path + '.tmp'):
                 try:
                     os.remove(leftover)
                 except FileNotFoundError:
                     pass
         finally:
-            if temp_filename in caching_file_list:
-                caching_file_list.remove(temp_filename)
+            caching_file_list_remove(caching_file_list, chunk_path)
 
     def _get_temp_directory(self):
+        """Temporary directory for in-progress uploads (NOT for read chunks)."""
         temp_directory = os.path.join(tempfile.gettempdir(), 'degoo')
         if not os.path.exists(temp_directory):
             os.makedirs(temp_directory)
@@ -1069,26 +1283,81 @@ class Operations(pyfuse3.Operations):
         return filename
 
     def _get_temp_file(self, degoo_path_file, filepart):
-        filename = self._get_filename(degoo_path_file)
-        name = filename[:filename.rfind('.')]
-        extension = filename[filename.rfind('.') + 1:]
-        temp_filename = name + '_' + str(filepart) + '.' + extension
-        return os.path.join(self._get_temp_directory(), temp_filename)
+        """Return the persistent chunk path for the given file+part.
 
-    def _clear_files(self, filename, skip_filename=None):
-        filename = self._get_filename(filename)
+        Delegates to ChunkCache so the path is always stable and registered
+        in the database.
+        """
+        item_id = self._get_degoo_id(degoo_path_file)
+        if item_id is None:
+            # Fallback: derive a name from the display filename (legacy behaviour).
+            filename = self._get_filename(degoo_path_file)
+            name = filename[:filename.rfind('.')] if '.' in filename else filename
+            ext = filename[filename.rfind('.') + 1:] if '.' in filename else 'bin'
+            return os.path.join(self._chunk_cache._cache_dir,
+                                f'{name}_{filepart}.{ext}')
+        return self._chunk_cache.chunk_path(item_id, filepart)
 
-        if '.' in filename:
-            filename = filename[:filename.rfind('.')]
+    def _clear_files(self, filename, skip_filename=None,
+                     skip_item_id=None, skip_part=None):
+        """Evict all cached chunks for *filename* except an optional skip chunk.
 
+        When skip_item_id / skip_part are provided the identified chunk is
+        kept; all other chunks for the same file are evicted via ChunkCache.
+        The legacy skip_filename parameter is retained for compatibility.
+        """
+        item_id = self._get_degoo_id(filename) if '/' in filename else None
+
+        if item_id is not None:
+            # Determine which parts to keep
+            keep_part = skip_part if skip_item_id == item_id else None
+            conn = self._chunk_cache._conn()
+            rows = conn.execute(
+                'SELECT part, path FROM chunks WHERE item_id=?', (item_id,)
+            ).fetchall()
+            for part, path in rows:
+                if keep_part is not None and part == keep_part:
+                    continue
+                try:
+                    os.remove(path)
+                    log.debug('_clear_files: evicted chunk %s', path)
+                except FileNotFoundError:
+                    pass
+            if keep_part is not None:
+                conn.execute(
+                    'DELETE FROM chunks WHERE item_id=? AND part != ?',
+                    (item_id, keep_part)
+                )
+            else:
+                conn.execute('DELETE FROM chunks WHERE item_id=?', (item_id,))
+            conn.commit()
+            return
+
+        # Legacy fallback: glob-based eviction for upload temp files
+        base = self._get_filename(filename)
+        if '.' in base:
+            base = base[:base.rfind('.')]
         if skip_filename and '/' in skip_filename:
             skip_filename = skip_filename[skip_filename.rfind('/') + 1:]
-
-        filename = glob.escape(filename)
-        for file in glob.glob(os.path.join(self._get_temp_directory(), filename) + "*", recursive=False):
+        base = glob.escape(base)
+        for file in glob.glob(os.path.join(self._get_temp_directory(), base) + '*',
+                              recursive=False):
             if self._get_filename(file) != skip_filename:
-                log.debug('Removing part %s', file)
-                os.remove(file)
+                log.debug('Removing upload temp %s', file)
+                try:
+                    os.remove(file)
+                except FileNotFoundError:
+                    pass
+
+    def _clear_upload_temp(self, path_file):
+        """Remove only the upload temp file (not persistent read chunks)."""
+        filename = self._get_filename(path_file)
+        temp_path = os.path.join(self._get_temp_directory(), filename)
+        try:
+            os.remove(temp_path)
+            log.debug('Removed upload temp %s', temp_path)
+        except FileNotFoundError:
+            pass
 
     def _refresh_path(self):
         for idx, degoo_element in degoo_tree_content.items():
@@ -1103,29 +1372,28 @@ class Operations(pyfuse3.Operations):
                     del self._inode_path_map[inode]
                     self._add_path(inode, path)
 
-    def run_maintenance(self, interval=60):
+    def run_maintenance(self, interval=60, max_chunk_age=3600):
+        """Periodically evict stale chunks from the persistent ChunkCache.
+
+        Replaces the old os.stat()-based loop that only cleaned /tmp/degoo/.
+        Chunks not accessed within *max_chunk_age* seconds are removed from
+        both the filesystem and the database.
+        """
         cease_continuous_run = threading.Event()
+
+        chunk_cache_ref = self._chunk_cache  # capture for thread closure
 
         class ScheduleThread(threading.Thread):
             @classmethod
             def run(cls):
                 while not cease_continuous_run.is_set():
-                    for file in glob.glob(self._get_temp_directory() + os.sep + "*", recursive=False):
-                        try:
-                            file_stat = os.stat(file)
-                            now = datetime.datetime.now()
-                            access_time = datetime.datetime.fromtimestamp(file_stat[stat_m.ST_ATIME])
-                            seconds = (now - access_time).total_seconds()
-                            hours = divmod(seconds, 3600)[0]
-                            if hours > 1:
-                                log.debug('Maintenance: Removing file %s', file)
-                                os.remove(file)
-                        except FileNotFoundError:
-                            pass
-
+                    evicted = chunk_cache_ref.evict_stale(max_chunk_age)
+                    if evicted:
+                        log.debug('Maintenance: evicted %d stale chunks', evicted)
                     time.sleep(interval)
 
         continuous_thread = ScheduleThread()
+        continuous_thread.daemon = True
         continuous_thread.start()
         return cease_continuous_run
 
@@ -1170,6 +1438,17 @@ class Operations(pyfuse3.Operations):
         self._refresh_path()
 
         threadLock.release()
+
+
+# ---------------------------------------------------------------------------
+# Small thread-safe helper (avoids ValueError when removing from list)
+# ---------------------------------------------------------------------------
+
+def caching_file_list_remove(lst, value):
+    try:
+        lst.remove(value)
+    except ValueError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1257,6 +1536,21 @@ def parse_args(args):
                             'Set to a tmpfs path for a volatile in-process cache, or to a '
                             'shared volume path in Docker/Kubernetes deployments.'
                         ))
+    parser.add_argument('--chunk-cache-dir', type=str, default=_DEFAULT_CHUNK_CACHE_DIR,
+                        help=(
+                            'Directory where downloaded file chunks are stored persistently '
+                            '(default: %(default)s). '
+                            'Point this at a large persistent volume to avoid re-downloading '
+                            'chunks across restarts.  Chunks are named '
+                            '<item_id>_<part>.chunk and evicted after --chunk-max-age seconds '
+                            'of inactivity.'
+                        ))
+    parser.add_argument('--chunk-max-age', type=int, default=3600,
+                        help=(
+                            'Maximum age in seconds for a cached chunk before it is evicted '
+                            'by the maintenance thread (default: 3600 = 1 hour). '
+                            'Set to 0 to disable eviction entirely.'
+                        ))
 
     return parser.parse_args(args)
 
@@ -1285,6 +1579,8 @@ def main():
     subchunk_connections = options.subchunk_connections
     lookahead_chunks = options.lookahead_chunks
     db_path = options.db_path
+    chunk_cache_dir = options.chunk_cache_dir
+    chunk_max_age = options.chunk_max_age
 
     log.debug('##### Initializing Degoo drive (cligoo backend) #####')
     log.debug('Local mount point:      %s', options.mountpoint)
@@ -1293,6 +1589,8 @@ def main():
     log.debug('Sub-chunk connections:  %d', subchunk_connections)
     log.debug('Lookahead chunks:       %d', lookahead_chunks)
     log.debug('Tree cache DB:          %s', db_path)
+    log.debug('Chunk cache dir:        %s', chunk_cache_dir)
+    log.debug('Chunk max age:          %d seconds', chunk_max_age)
     if degoo_email and degoo_pass:
         log.debug('Degoo email:            %s', degoo_email)
         log.debug('Degoo pass:             %s', '*' * len(degoo_pass))
@@ -1321,12 +1619,21 @@ def main():
     # ---------------------------------------------------------------------------
     # Initialise the SQLite-backed tree cache
     # ---------------------------------------------------------------------------
-    global tree_cache, degoo_tree_content
+    global tree_cache, chunk_cache, degoo_tree_content
     tree_cache = TreeCache(db_path)
     degoo_tree_content = tree_cache
     log.debug(
         'Tree cache opened: %s  (%d entries already cached)',
         db_path, len(tree_cache)
+    )
+
+    # ---------------------------------------------------------------------------
+    # Initialise the persistent chunk cache (shares the same DB file)
+    # ---------------------------------------------------------------------------
+    chunk_cache = ChunkCache(db_path=db_path, cache_dir=chunk_cache_dir)
+    log.debug(
+        'Chunk cache opened: %s  (%d chunks already cached)',
+        chunk_cache_dir, len(chunk_cache)
     )
 
     # Build the shared HTTP session (large connection pool for parallel sub-ranges)
@@ -1359,6 +1666,7 @@ def main():
         change_hostname=change_hostname,
         mode=mode,
         plex_split_file=plex_split_file,
+        chunk_cache=chunk_cache,
         download_threads=download_threads,
         subchunk_connections=subchunk_connections,
         lookahead_chunks=lookahead_chunks,
@@ -1385,8 +1693,10 @@ def main():
         t1.start()
 
     run_maintenance = None
-    if plex_split_file:
-        run_maintenance = operations.run_maintenance()
+    if plex_split_file or chunk_max_age > 0:
+        run_maintenance = operations.run_maintenance(
+            interval=60, max_chunk_age=chunk_max_age
+        )
 
     try:
         log.debug('Entering main loop..')

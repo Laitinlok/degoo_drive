@@ -164,23 +164,61 @@ class MountWorker(QThread):
             while not self._stop_event.is_set():
                 ret = self._proc.poll()
                 if ret is not None:
+                    # Process died on its own (not via our stop() call).
+                    # Exit codes from SIGTERM (-15) or SIGKILL (-9) are NOT
+                    # errors from the user's perspective -- treat them as stopped.
                     self.log_line.emit(f"[degoo-gui] process exited with code {ret}")
-                    self.status_changed.emit("error" if ret != 0 else "stopped")
+                    natural_error = ret not in (0, -signal.SIGTERM, -signal.SIGKILL)
+                    self.status_changed.emit("error" if natural_error else "stopped")
                     return
                 time.sleep(1)
 
+            # ── User requested stop ──────────────────────────────────────────
+            # 1. Ask fuse_degoo to exit cleanly via SIGTERM to its process group.
             try:
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                self._proc.wait(timeout=10)
+                self._proc.wait(timeout=8)
             except Exception:
-                self._proc.kill()
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+
+            # 2. Force-unmount the FUSE mountpoint so the kernel releases the
+            #    directory even if the process exited uncleanly (e.g. --allow-other
+            #    was rejected and fuse_degoo never fully started the VFS).
+            self._unmount(str(mountpoint))
 
             self.status_changed.emit("stopped")
             self.log_line.emit("[degoo-gui] mount stopped")
 
         except Exception as exc:
             self.log_line.emit(f"[degoo-gui] error: {exc}")
+            # Attempt unmount even on unexpected errors so the mountpoint
+            # does not remain in a "transport endpoint is not connected" state.
+            self._unmount(s.get("mountpoint", ""))
             self.status_changed.emit("error")
+
+    def _unmount(self, mountpoint: str) -> None:
+        """Try fusermount3 -u then fusermount -u as fallback."""
+        if not mountpoint:
+            return
+        for cmd in (["fusermount3", "-u", mountpoint],
+                    ["fusermount",  "-u", mountpoint]):
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=5)
+                if result.returncode == 0:
+                    self.log_line.emit(f"[degoo-gui] unmounted {mountpoint}")
+                    return
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        # Last resort: umount (may need sudo, will fail silently if not available)
+        try:
+            subprocess.run(["umount", mountpoint], capture_output=True, timeout=5)
+        except Exception:
+            pass
 
     def stop(self):
         self._stop_event.set()
@@ -412,8 +450,11 @@ class DegooTrayApp:
             self._tray.showMessage("Degoo Drive", "Mount started successfully.",
                                    QSystemTrayIcon.MessageIcon.Information, 2000)
         elif status == "error":
-            self._tray.showMessage("Degoo Drive", "Mount failed — check logs.",
-                                   QSystemTrayIcon.MessageIcon.Critical, 4000)
+            self._tray.showMessage(
+                "Degoo Drive",
+                "Mount failed — check logs.\nClick ▶ Start mount to retry.",
+                QSystemTrayIcon.MessageIcon.Critical, 5000,
+            )
 
     def _on_log(self, line: str):
         pass

@@ -107,6 +107,10 @@ class TreeCache:
     Each entry is stored as a JSON blob keyed by the integer item ID.
     The database uses WAL journaling so concurrent readers never block writers.
 
+    A ``parent_id`` column is maintained alongside each row and indexed so
+    that :meth:`children_of` can retrieve all direct children in O(children)
+    time rather than scanning every row.
+
     The class exposes the minimal dict-like interface used throughout this
     module:  ``__getitem__``, ``__setitem__``, ``__delitem__``,
     ``__contains__``, ``__iter__``, ``items()``, ``values()``, ``get()``,
@@ -121,7 +125,26 @@ class TreeCache:
         conn = self._conn()
         conn.execute(
             'CREATE TABLE IF NOT EXISTS items '
-            '(inode INTEGER PRIMARY KEY, payload TEXT NOT NULL)'
+            '(inode INTEGER PRIMARY KEY, parent_id INTEGER, payload TEXT NOT NULL)'
+        )
+        # Migration: databases created before parent_id was introduced only
+        # have (inode, payload).  ALTER TABLE adds the column without touching
+        # existing rows (they get NULL, which is fine — writes will backfill).
+        existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(items)')}
+        if 'parent_id' not in existing_cols:
+            log.warning(
+                'tree_cache.db is missing the parent_id column — '
+                'applying schema migration (ALTER TABLE items ADD COLUMN parent_id INTEGER)'
+            )
+            conn.execute('ALTER TABLE items ADD COLUMN parent_id INTEGER')
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_items_parent_id ON items(parent_id)'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_items_filepath ON items(json_extract(payload, \'$.FilePath\'))'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_items_name ON items(json_extract(payload, \'$.Name\'))'
         )
         conn.execute('PRAGMA journal_mode=WAL')
         conn.commit()
@@ -152,9 +175,10 @@ class TreeCache:
 
     def __setitem__(self, inode: int, value: dict) -> None:
         conn = self._conn()
+        parent_id = int(value.get('ParentID') or 0) if isinstance(value, dict) else None
         conn.execute(
-            'INSERT OR REPLACE INTO items (inode, payload) VALUES (?, ?)',
-            (int(inode), json.dumps(value)),
+            'INSERT OR REPLACE INTO items (inode, parent_id, payload) VALUES (?, ?, ?)',
+            (int(inode), parent_id, json.dumps(value)),
         )
         conn.commit()
 
@@ -173,11 +197,42 @@ class TreeCache:
         for row in self._conn().execute('SELECT inode FROM items'):
             yield row[0]
 
+
+    def id_by_filepath(self, filepath: str):
+        """Return the inode/ID of the entry whose FilePath equals *filepath*, or None.
+
+        Uses the json_extract index — O(log N) instead of a full scan.
+        """
+        row = self._conn().execute(
+            "SELECT inode FROM items WHERE json_extract(payload, '$.FilePath')=?",
+            (filepath,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def id_by_name(self, name: str):
+        """Return the inode/ID of the first entry whose Name equals *name*, or None.
+
+        Uses the json_extract index — O(log N) instead of a full scan.
+        """
+        row = self._conn().execute(
+            "SELECT inode FROM items WHERE json_extract(payload, '$.Name')=?",
+            (name,),
+        ).fetchone()
+        return row[0] if row else None
+
     def get(self, inode: int, default=None):
         try:
             return self[inode]
         except KeyError:
             return default
+
+    def children_of(self, parent_id: int) -> list:
+        """Return list of entry dicts whose ParentID == parent_id.
+        Uses the parent_id index — O(children) not O(total items)."""
+        rows = self._conn().execute(
+            'SELECT payload FROM items WHERE parent_id=?', (int(parent_id),)
+        ).fetchall()
+        return [json.loads(r[0]) for r in rows]
 
     def items(self):
         for row in self._conn().execute('SELECT inode, payload FROM items'):
@@ -513,9 +568,12 @@ def _build_tree_parallel(root_id: int, root_path: str, mode: str, workers: int =
 def _fetch_dir_if_needed(dir_id: int, mode: str) -> None:
     """Fetch children of *dir_id* from the API if not yet loaded (lazy mode)."""
     if mode == 'lazy':
-        has_children = any(
-            e['ParentID'] == dir_id for e in degoo_tree_content.values()
-        )
+        if hasattr(degoo_tree_content, 'children_of'):
+            has_children = len(degoo_tree_content.children_of(dir_id)) > 0
+        else:
+            has_children = any(
+                e['ParentID'] == dir_id for e in degoo_tree_content.values()
+            )
         if not has_children:
             parent = degoo_tree_content.get(dir_id)
             p_path = parent['FilePath'] if parent else '/'
@@ -628,13 +686,17 @@ class Operations(pyfuse3.Operations):
 
         # BUG FIX: cp/mv/cat/stat never call opendir+readdir first, so in
         # lazy mode the directory children may not yet be in degoo_tree_content.
-        # Trigger a fetch for this parent dir if it has no children yet,
-        # exactly as readdir() already does.
-        if self._mode == 'lazy' and not any(
-            e['ParentID'] == inode_p for e in degoo_tree_content.values()
-        ):
-            _fetch_dir_if_needed(inode_p, self._mode)
-            self._refresh_path()
+        # Trigger a fetch for this parent dir if it has no children yet.
+        if self._mode == 'lazy':
+            if hasattr(degoo_tree_content, 'children_of'):
+                _no_children = len(degoo_tree_content.children_of(inode_p)) == 0
+            else:
+                _no_children = not any(
+                    e['ParentID'] == inode_p for e in degoo_tree_content.values()
+                )
+            if _no_children:
+                _fetch_dir_if_needed(inode_p, self._mode)
+                self._refresh_path(inode_p)
 
         children = self._get_degoo_childs(inode_p)
         attr = None
@@ -670,13 +732,23 @@ class Operations(pyfuse3.Operations):
         return inode
 
     def _get_degoo_id(self, name):
-        folder_id = None
+        """Return the Degoo item ID for *name* (a FilePath or a bare Name).
+
+        Uses the SQLite json_extract indices on FilePath / Name so this is
+        O(log N) instead of the previous O(N) full table scan.  This method
+        is called on every FUSE operation that resolves a path, so the
+        improvement compounds significantly on large trees.
+        """
+        if hasattr(degoo_tree_content, 'id_by_filepath'):
+            if '/' in name:
+                return degoo_tree_content.id_by_filepath(name)
+            return degoo_tree_content.id_by_name(name)
+        # Fallback for non-TreeCache implementations (tests / mocks).
         attr = 'FilePath' if '/' in name else 'Name'
-        for idx, degoo_element in degoo_tree_content.items():
-            if degoo_element[attr] == name:
-                folder_id = degoo_element['ID']
-                break
-        return folder_id
+        for _idx, element in degoo_tree_content.items():
+            if element[attr] == name:
+                return element['ID']
+        return None
 
     def _get_degoo_element(self, name):
         element_id = self._get_degoo_id(name)
@@ -701,9 +773,12 @@ class Operations(pyfuse3.Operations):
     def _get_degoo_childs(self, parent_id):
         childs = []
         if parent_id is not None:
-            for idx, degoo_element in degoo_tree_content.items():
-                if degoo_element['ParentID'] == parent_id:
-                    childs.append(degoo_element)
+            if hasattr(degoo_tree_content, 'children_of'):
+                childs = degoo_tree_content.children_of(parent_id)
+            else:
+                for idx, degoo_element in degoo_tree_content.items():
+                    if degoo_element['ParentID'] == parent_id:
+                        childs.append(degoo_element)
         return childs
 
     def _get_degoo_attrs(self, name):
@@ -777,7 +852,7 @@ class Operations(pyfuse3.Operations):
 
         if self._mode == 'lazy' and len(children) == 0:
             _fetch_dir_if_needed(parent_id, self._mode)
-            self._refresh_path()
+            self._refresh_path(parent_id)
             children = self._get_degoo_childs(parent_id)
 
         entries = []
@@ -795,9 +870,6 @@ class Operations(pyfuse3.Operations):
 
     async def unlink(self, inode_p, name, ctx):
         name = fsdecode(name)
-        # fullpath=True: we need the complete FilePath so _get_degoo_id()
-        # looks up by FilePath (contains '/') instead of just Name, which
-        # prevents resolving to the wrong file when two items share a name.
         parent = self._inode_to_path(inode_p, fullpath=True)
         path = parent.rstrip('/') + '/' + name
 
@@ -815,8 +887,6 @@ class Operations(pyfuse3.Operations):
 
     async def rmdir(self, inode_p, name, ctx):
         name = fsdecode(name)
-        # fullpath=True: same reason as unlink — we need the absolute path
-        # so _get_degoo_id() can resolve by FilePath, not just Name.
         parent = self._inode_to_path(inode_p, fullpath=True)
         path = parent.rstrip('/') + '/' + name
 
@@ -856,7 +926,7 @@ class Operations(pyfuse3.Operations):
 
         if self._mode == 'lazy' and len(self._get_degoo_childs(inode_p_new)) == 0:
             _fetch_dir_if_needed(inode_p_new, self._mode)
-            self._refresh_path()
+            self._refresh_path(inode_p_new)
 
         if inode_p_old == inode_p_new:
             _client.rename(str(inode), name_new)
@@ -896,12 +966,6 @@ class Operations(pyfuse3.Operations):
 
     async def mkdir(self, inode_p, name, mode, ctx):
         name = fsdecode(name)
-        # fullpath=True is critical here: without it _inode_to_path() strips
-        # everything before the last '/' and returns only the directory name
-        # (e.g. "Music").  _get_degoo_id() then falls into the Name-based
-        # lookup branch (no '/' in the string) and can match the wrong entry
-        # or return None, so _client.mkdir() gets a bad parent_id and the
-        # Degoo API responds with "Error creating entries!".
         base_path = self._inode_to_path(inode_p, fullpath=True)
         element_id = self._get_degoo_id(base_path)
 
@@ -1134,37 +1198,45 @@ class Operations(pyfuse3.Operations):
                     return
 
             log.debug('Releasing file %s', filename)
-            # Chunks stay in the persistent cache; only evict from the
-            # in-progress upload temp dir.
             self._clear_upload_temp(element['FilePath'])
 
             return
         except Exception:
             pass
 
+        # Guard: pyfuse3/Trio can deliver a release callback for an fd that has
+        # already been cleaned up (duplicate release or race during teardown).
+        # Treat it as a no-op rather than raising KeyError and crashing the mount.
+        if fd not in self._fd_open_count:
+            log.debug('release: fd %s already released; ignoring duplicate', fd)
+            return
+
         if self._fd_open_count[fd] > 1:
             self._fd_open_count[fd] -= 1
             return
 
+        self._fd_open_count.pop(fd, None)
         if fd in self._fd_buffer_length:
             del self._fd_buffer_length[fd]
 
-        del self._fd_open_count[fd]
-        inode = self._fd_inode_map[fd]
-        del self._inode_fd_map[inode]
-        del self._fd_inode_map[fd]
+        inode = self._fd_inode_map.pop(fd, None)
+        if inode is not None:
+            self._inode_fd_map.pop(inode, None)
         try:
             os.close(fd)
         except OSError as exc:
             raise FUSEError(exc.errno)
 
-        source_file = self._inode_to_path(inode, fullpath=True)
-
-        del self._inode_path_map[inode]
-        try:
-            os.remove(source_file)
-        except FileNotFoundError:
-            pass
+        if inode is not None:
+            source_file = self._inode_to_path(inode, fullpath=True)
+            try:
+                del self._inode_path_map[inode]
+            except KeyError:
+                pass
+            try:
+                os.remove(source_file)
+            except FileNotFoundError:
+                pass
 
     def _check_requests(self):
         if self._enable_flood_control:
@@ -1197,24 +1269,7 @@ class Operations(pyfuse3.Operations):
         return is_media_type
 
     def _cache_file(self, degoo_path_file: str, file_part: int, degoo_file_size: int) -> None:
-        """Download one cache-chunk using multiple parallel sub-range requests.
-
-        The chunk is written to the persistent ChunkCache directory so it
-        survives restarts.  On subsequent mounts the chunk is served directly
-        from disk without contacting the Degoo CDN.
-
-        Strategy
-        --------
-        Degoo's CDN enforces a per-TCP-connection bandwidth cap of ~8 MB/s.
-        To saturate the available uplink we split each `_cache_size` chunk into
-        `_subchunk_connections` equal sub-ranges and fetch them simultaneously
-        on separate TCP connections (separate urllib3 sockets, all sharing the
-        same Session connection pool).  The sub-range bytes are reassembled
-        in order and written to the temp file as a single contiguous block.
-
-        Falls back to a single-connection download if the server returns 200
-        (full content) instead of 206 (partial content).
-        """
+        """Download one cache-chunk using multiple parallel sub-range requests."""
         global caching_file_list
 
         item_id = self._get_degoo_id(degoo_path_file)
@@ -1222,9 +1277,6 @@ class Operations(pyfuse3.Operations):
             log.debug('WARN: No item ID for path %s', degoo_path_file)
             raise pyfuse3.FUSEError(errno.ENOENT)
 
-        # ------------------------------------------------------------------
-        # Fast path: chunk already in persistent cache
-        # ------------------------------------------------------------------
         if self._chunk_cache.exists(item_id, file_part):
             chunk_path = self._chunk_cache.chunk_path(item_id, file_part)
             log.debug('Chunk cache hit: item=%d part=%d [%s]', item_id, file_part, chunk_path)
@@ -1241,7 +1293,7 @@ class Operations(pyfuse3.Operations):
                 if item_id in degoo_tree_content:
                     entry = degoo_tree_content[item_id]
                     entry['URL'] = url
-                    degoo_tree_content[item_id] = entry  # write back to DB
+                    degoo_tree_content[item_id] = entry
             except DegooAPIError as e:
                 log.debug('Error getting info for file [%s]: %s', degoo_path_file, str(e))
 
@@ -1265,25 +1317,21 @@ class Operations(pyfuse3.Operations):
             log.debug('Changing hostname [%s] to [%s]', url_parsed.hostname, DEGOO_HOSTNAME_EU)
             url = url_parsed._replace(netloc=DEGOO_HOSTNAME_EU).geturl()
 
-        # Byte range for this chunk
         chunk_start = file_part * self._cache_size
         chunk_end_inclusive = min(chunk_start + self._cache_size, degoo_file_size) - 1
         chunk_bytes = chunk_end_inclusive - chunk_start + 1
 
-        # Double-check: another thread may have finished while we were fetching the URL.
         if self._chunk_cache.exists(item_id, file_part):
             self._chunk_cache.touch(item_id, file_part)
             caching_file_list_remove(caching_file_list, chunk_path)
             return
 
         n = self._subchunk_connections
-        # Minimum sub-chunk size: 256 KB — don't open 8 connections for a tiny tail chunk.
         min_subchunk = 256 * 1024
         if chunk_bytes < min_subchunk * n:
             n = max(1, chunk_bytes // min_subchunk)
 
         sub_size = chunk_bytes // n
-        # Build list of (start, end_inclusive) byte ranges for each sub-chunk
         ranges = []
         for i in range(n):
             s = chunk_start + i * sub_size
@@ -1296,7 +1344,6 @@ class Operations(pyfuse3.Operations):
         )
 
         def _fetch_range(byte_start: int, byte_end: int) -> tuple:
-            """Fetch a single byte sub-range; returns (byte_start, data)."""
             resp = _http_session.get(
                 url,
                 headers={'Range': f'bytes={byte_start}-{byte_end}'},
@@ -1306,8 +1353,6 @@ class Operations(pyfuse3.Operations):
             if resp.status_code == 206:
                 return (byte_start, resp.content)
             if resp.status_code == 200:
-                # Server ignored the Range header and sent the whole file.
-                # Slice out only the bytes we need.
                 data = resp.content
                 local_start = byte_start - chunk_start
                 local_end   = byte_end   - chunk_start + 1
@@ -1315,8 +1360,6 @@ class Operations(pyfuse3.Operations):
             resp.raise_for_status()
 
         try:
-            # Use a *dedicated* inner executor so sub-chunk futures don't
-            # starve the outer chunk-level pool.
             with ThreadPoolExecutor(
                 max_workers=n, thread_name_prefix="degoo-sub"
             ) as sub_pool:
@@ -1324,7 +1367,7 @@ class Operations(pyfuse3.Operations):
                     sub_pool.submit(_fetch_range, s, e): (s, e)
                     for s, e in ranges
                 }
-                results = {}  # byte_start -> data
+                results = {}
                 for fut in as_completed(futures):
                     s, _ = futures[fut]
                     try:
@@ -1337,21 +1380,18 @@ class Operations(pyfuse3.Operations):
                         )
                         raise
 
-            # Reassemble in order and write atomically
             assembled = b''.join(results[s] for s, _ in ranges)
             tmp_write = chunk_path + '.tmp'
             with open(tmp_write, 'wb') as out:
                 out.write(assembled)
-            os.replace(tmp_write, chunk_path)  # atomic on POSIX
+            os.replace(tmp_write, chunk_path)
 
-            # Register in DB so future mounts find it instantly.
             self._chunk_cache.register(item_id, file_part, chunk_path, len(assembled))
 
             log.debug('Downloaded + cached chunk [%s] (%d bytes)', chunk_path, len(assembled))
 
         except Exception as exc:
             log.debug('Error downloading chunk [%s]: %s', chunk_path, exc)
-            # Clean up any partial file so a retry will re-attempt
             for leftover in (chunk_path, chunk_path + '.tmp'):
                 try:
                     os.remove(leftover)
@@ -1361,7 +1401,6 @@ class Operations(pyfuse3.Operations):
             caching_file_list_remove(caching_file_list, chunk_path)
 
     def _get_temp_directory(self):
-        """Temporary directory for in-progress uploads (NOT for read chunks)."""
         temp_directory = os.path.join(tempfile.gettempdir(), 'degoo')
         if not os.path.exists(temp_directory):
             os.makedirs(temp_directory)
@@ -1374,14 +1413,8 @@ class Operations(pyfuse3.Operations):
         return filename
 
     def _get_temp_file(self, degoo_path_file, filepart):
-        """Return the persistent chunk path for the given file+part.
-
-        Delegates to ChunkCache so the path is always stable and registered
-        in the database.
-        """
         item_id = self._get_degoo_id(degoo_path_file)
         if item_id is None:
-            # Fallback: derive a name from the display filename (legacy behaviour).
             filename = self._get_filename(degoo_path_file)
             name = filename[:filename.rfind('.')] if '.' in filename else filename
             ext = filename[filename.rfind('.') + 1:] if '.' in filename else 'bin'
@@ -1391,16 +1424,9 @@ class Operations(pyfuse3.Operations):
 
     def _clear_files(self, filename, skip_filename=None,
                      skip_item_id=None, skip_part=None):
-        """Evict all cached chunks for *filename* except an optional skip chunk.
-
-        When skip_item_id / skip_part are provided the identified chunk is
-        kept; all other chunks for the same file are evicted via ChunkCache.
-        The legacy skip_filename parameter is retained for compatibility.
-        """
         item_id = self._get_degoo_id(filename) if '/' in filename else None
 
         if item_id is not None:
-            # Determine which parts to keep
             keep_part = skip_part if skip_item_id == item_id else None
             conn = self._chunk_cache._conn()
             rows = conn.execute(
@@ -1424,7 +1450,6 @@ class Operations(pyfuse3.Operations):
             conn.commit()
             return
 
-        # Legacy fallback: glob-based eviction for upload temp files
         base = self._get_filename(filename)
         if '.' in base:
             base = base[:base.rfind('.')]
@@ -1441,7 +1466,6 @@ class Operations(pyfuse3.Operations):
                     pass
 
     def _clear_upload_temp(self, path_file):
-        """Remove only the upload temp file (not persistent read chunks)."""
         filename = self._get_filename(path_file)
         temp_path = os.path.join(self._get_temp_directory(), filename)
         try:
@@ -1450,29 +1474,41 @@ class Operations(pyfuse3.Operations):
         except FileNotFoundError:
             pass
 
-    def _refresh_path(self):
-        for idx, degoo_element in degoo_tree_content.items():
-            if self._source in degoo_element['FilePath']:
-                attr = self._get_degoo_attrs(degoo_element['FilePath'])
-                inode = attr.st_ino
-                path = degoo_element['FilePath']
+    def _refresh_path(self, parent_id: int = None):
+        """Register inode→path mappings after a lazy directory fetch.
 
+        When *parent_id* is supplied and the cache supports children_of(),
+        only the direct children of that directory are registered — O(children)
+        instead of a full O(N) scan of the entire tree.
+
+        Falls back to the original full-scan behaviour when called without a
+        parent_id (e.g. from load_degoo_content after an eager full fetch).
+        """
+        if parent_id is not None and hasattr(degoo_tree_content, 'children_of'):
+            for entry in degoo_tree_content.children_of(parent_id):
+                path = entry['FilePath']
+                inode = int(entry['ID'])
                 if inode not in self._inode_path_map:
                     self._add_path(inode, path)
-                elif inode in self._inode_path_map and self._inode_path_map[inode] != path:
+                elif self._inode_path_map[inode] != path:
                     del self._inode_path_map[inode]
                     self._add_path(inode, path)
+        else:
+            for _idx, degoo_element in degoo_tree_content.items():
+                if self._source in degoo_element['FilePath']:
+                    attr = self._get_degoo_attrs(degoo_element['FilePath'])
+                    inode = attr.st_ino
+                    path = degoo_element['FilePath']
+                    if inode not in self._inode_path_map:
+                        self._add_path(inode, path)
+                    elif self._inode_path_map[inode] != path:
+                        del self._inode_path_map[inode]
+                        self._add_path(inode, path)
 
     def run_maintenance(self, interval=60, max_chunk_age=3600):
-        """Periodically evict stale chunks from the persistent ChunkCache.
-
-        Replaces the old os.stat()-based loop that only cleaned /tmp/degoo/.
-        Chunks not accessed within *max_chunk_age* seconds are removed from
-        both the filesystem and the database.
-        """
         cease_continuous_run = threading.Event()
 
-        chunk_cache_ref = self._chunk_cache  # capture for thread closure
+        chunk_cache_ref = self._chunk_cache
 
         class ScheduleThread(threading.Thread):
             @classmethod

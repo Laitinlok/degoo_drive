@@ -115,6 +115,7 @@ class MountWorker(QThread):
         self._settings = settings
         self._proc: subprocess.Popen | None = None
         self._stop_event = threading.Event()
+        self._user_stopped = False  # set to True when stop() is called explicitly
 
     def run(self):
         s = self._settings
@@ -164,29 +165,36 @@ class MountWorker(QThread):
             while not self._stop_event.is_set():
                 ret = self._proc.poll()
                 if ret is not None:
-                    # Process died on its own (not via our stop() call).
-                    # Exit codes from SIGTERM (-15) or SIGKILL (-9) are NOT
-                    # errors from the user's perspective -- treat them as stopped.
+                    if self._stop_event.is_set():
+                        # Process already dead but stop was user-initiated —
+                        # fall through to the unmount block below.
+                        break
                     self.log_line.emit(f"[degoo-gui] process exited with code {ret}")
-                    natural_error = ret not in (0, -signal.SIGTERM, -signal.SIGKILL)
-                    self.status_changed.emit("error" if natural_error else "stopped")
+                    # Only show error if the user did NOT request the stop.
+                    if self._user_stopped:
+                        self.status_changed.emit("stopped")
+                    else:
+                        natural_error = ret not in (0, -signal.SIGTERM, -signal.SIGKILL)
+                        self.status_changed.emit("error" if natural_error else "stopped")
                     return
                 time.sleep(1)
 
             # ── User requested stop ──────────────────────────────────────────
-            # 1. Ask fuse_degoo to exit cleanly via SIGTERM to its process group.
-            try:
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                self._proc.wait(timeout=8)
-            except Exception:
+            # Send SIGTERM only if the process is still alive.
+            if self._proc.poll() is None:
                 try:
-                    self._proc.kill()
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                    self._proc.wait(timeout=4)
                 except Exception:
-                    pass
+                    try:
+                        self._proc.kill()
+                        self._proc.wait(timeout=2)
+                    except Exception:
+                        pass
 
-            # 2. Force-unmount the FUSE mountpoint so the kernel releases the
-            #    directory even if the process exited uncleanly (e.g. --allow-other
-            #    was rejected and fuse_degoo never fully started the VFS).
+            # Force-detach the FUSE mountpoint with lazy unmount so the
+            # kernel releases the directory even when the daemon has already
+            # exited uncleanly (transport endpoint broken).
             self._unmount(str(mountpoint))
 
             self.status_changed.emit("stopped")
@@ -197,30 +205,57 @@ class MountWorker(QThread):
             # Attempt unmount even on unexpected errors so the mountpoint
             # does not remain in a "transport endpoint is not connected" state.
             self._unmount(s.get("mountpoint", ""))
-            self.status_changed.emit("error")
+            # Honour user_stopped here too — if the user clicked Stop and an
+            # exception occurred during teardown, still show Stopped not Error.
+            self.status_changed.emit("stopped" if self._user_stopped else "error")
 
     def _unmount(self, mountpoint: str) -> None:
-        """Try fusermount3 -u then fusermount -u as fallback."""
+        """Detach a (possibly stale) FUSE mountpoint.
+
+        Uses -uz (lazy unmount) so a dead transport endpoint is always cleared
+        even when the FUSE daemon has already exited uncleanly.
+        """
         if not mountpoint:
             return
-        for cmd in (["fusermount3", "-u", mountpoint],
-                    ["fusermount",  "-u", mountpoint]):
+
+        # -z = lazy unmount: detaches the mountpoint even if the FUSE daemon
+        # has already died and the kernel transport is broken.
+        for cmd in (
+            ["fusermount3", "-uz", mountpoint],
+            ["fusermount",  "-uz", mountpoint],
+        ):
             try:
                 result = subprocess.run(cmd, capture_output=True, timeout=5)
                 if result.returncode == 0:
                     self.log_line.emit(f"[degoo-gui] unmounted {mountpoint}")
                     return
+                else:
+                    err = result.stderr.decode(errors="replace").strip()
+                    self.log_line.emit(
+                        f"[degoo-gui] {cmd[0]} -uz exited {result.returncode}: {err}"
+                    )
             except FileNotFoundError:
                 continue
-            except Exception:
+            except Exception as e:
+                self.log_line.emit(f"[degoo-gui] {cmd[0]} error: {e}")
                 continue
-        # Last resort: umount (may need sudo, will fail silently if not available)
+
+        # Last resort: umount -l (lazy) — detaches even busy/stale mounts.
+        # Does not require sudo for FUSE mounts owned by the current user.
         try:
-            subprocess.run(["umount", mountpoint], capture_output=True, timeout=5)
-        except Exception:
-            pass
+            result = subprocess.run(
+                ["umount", "-l", mountpoint], capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                self.log_line.emit(f"[degoo-gui] umount -l unmounted {mountpoint}")
+            else:
+                err = result.stderr.decode(errors="replace").strip()
+                self.log_line.emit(f"[degoo-gui] umount -l failed: {err}")
+        except Exception as e:
+            self.log_line.emit(f"[degoo-gui] umount -l error: {e}")
 
     def stop(self):
+        self._user_stopped = True
         self._stop_event.set()
 
 
@@ -431,7 +466,8 @@ class DegooTrayApp:
     def stop_mount(self):
         if self._worker:
             self._worker.stop()
-            self._worker.wait(5000)
+            self._worker.wait(12000)
+            self._worker = None
 
     def _on_status_changed(self, status: str):
         self._status = status

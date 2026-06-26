@@ -127,6 +127,16 @@ class TreeCache:
             'CREATE TABLE IF NOT EXISTS items '
             '(inode INTEGER PRIMARY KEY, parent_id INTEGER, payload TEXT NOT NULL)'
         )
+        # Migration: databases created before parent_id was introduced only
+        # have (inode, payload).  ALTER TABLE adds the column without touching
+        # existing rows (they get NULL, which is fine — writes will backfill).
+        existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(items)')}
+        if 'parent_id' not in existing_cols:
+            log.warning(
+                'tree_cache.db is missing the parent_id column — '
+                'applying schema migration (ALTER TABLE items ADD COLUMN parent_id INTEGER)'
+            )
+            conn.execute('ALTER TABLE items ADD COLUMN parent_id INTEGER')
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_items_parent_id ON items(parent_id)'
         )

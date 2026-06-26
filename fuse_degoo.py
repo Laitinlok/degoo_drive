@@ -456,7 +456,7 @@ def _cligoo_item_to_tree(item: dict, parent_path: str) -> dict:
 
 
 def _build_tree_recursive(parent_id: int, parent_path: str, mode: str) -> None:
-    """Populate degoo_tree_content by recursing through cligoo's list_dir."""
+    """Single-folder fetch used by lazy mode and _fetch_dir_if_needed."""
     items = _client.list_dir(str(parent_id), limit=None)
     for item in items:
         parent_entry = degoo_tree_content.get(parent_id)
@@ -466,6 +466,48 @@ def _build_tree_recursive(parent_id: int, parent_path: str, mode: str) -> None:
 
         if mode != 'lazy' and entry['isFolder']:
             _build_tree_recursive(entry['ID'], entry['FilePath'], mode)
+
+
+def _build_tree_parallel(root_id: int, root_path: str, mode: str, workers: int = 8) -> None:
+    """BFS parallel tree fetch -- each directory listing runs in its own thread.
+
+    Compared with the serial recursive approach this keeps *workers* API
+    connections busy simultaneously, which dramatically reduces wall-clock
+    time when a large number of sub-directories must be scanned.  The
+    TreeCache (SQLite WAL + per-thread connections) is safe for concurrent
+    writes, so multiple threads can call ``degoo_tree_content[k] = v``
+    without additional locking.
+
+    Falls back to the serial recursive helper for ``mode=lazy`` so that
+    single-directory on-demand fetches are not penalised by thread overhead.
+    """
+    if mode == 'lazy':
+        _build_tree_recursive(root_id, root_path, mode)
+        return
+
+    queue = [(root_id, root_path)]
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="degoo-tree") as pool:
+        while queue:
+            futures = {
+                pool.submit(_client.list_dir, str(pid), None): (pid, ppath)
+                for pid, ppath in queue
+            }
+            queue = []
+            for future in as_completed(futures):
+                pid, ppath = futures[future]
+                try:
+                    items = future.result()
+                except Exception as exc:
+                    log.warning('_build_tree_parallel: list_dir failed: %s %s', pid, exc)
+                    continue
+                for item in items:
+                    parent_entry = degoo_tree_content.get(pid)
+                    p_path = parent_entry['FilePath'] if parent_entry else ppath
+                    entry = _cligoo_item_to_tree(item, p_path)
+                    degoo_tree_content[entry['ID']] = entry
+                    if entry['isFolder']:
+                        queue.append((entry['ID'], entry['FilePath']))
 
 
 def _fetch_dir_if_needed(dir_id: int, mode: str) -> None:
@@ -1454,12 +1496,9 @@ class Operations(pyfuse3.Operations):
         log.debug('Refresh content finished')
 
     def load_degoo_content(self):
-        threadLock.acquire()
-
-        # Clear the DB so stale entries from deleted/moved files are removed
-        # before we repopulate from the live API.
-        degoo_tree_content.clear()
-
+        # Resolve root and fetch the full tree *outside* the lock so that
+        # FUSE operations (lookup, readdir, getattr) are not blocked for the
+        # entire duration of a potentially slow API scan.
         root_item = _client.resolve_path(self._source)
         if root_item is None:
             raise RuntimeError(f'Degoo path not found: {self._source}')
@@ -1478,15 +1517,20 @@ class Operations(pyfuse3.Operations):
             'URL': None,
             'Category': root_item.get('Category', 2),
         }
-        degoo_tree_content[root_id] = root_entry
 
-        _build_tree_recursive(root_id, self._source, self._mode)
+        # Clear + insert root while holding the lock (fast, no I/O).
+        with threadLock:
+            degoo_tree_content.clear()
+            degoo_tree_content[root_id] = root_entry
 
-        id_root_degoo = root_id
-        self._set_id_root_degoo(id_root_degoo)
-        self._refresh_path()
+        # Parallel BFS fetch -- runs outside the lock so FUSE ops stay responsive.
+        workers = getattr(self._download_executor, '_max_workers', 8)
+        _build_tree_parallel(root_id, self._source, self._mode, workers=workers)
 
-        threadLock.release()
+        # Final bookkeeping back under the lock.
+        with threadLock:
+            self._set_id_root_degoo(root_id)
+            self._refresh_path()
 
 
 # ---------------------------------------------------------------------------

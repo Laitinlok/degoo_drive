@@ -140,6 +140,12 @@ class TreeCache:
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_items_parent_id ON items(parent_id)'
         )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_items_filepath ON items(json_extract(payload, \'$.FilePath\'))'
+        )
+        conn.execute(
+            'CREATE INDEX IF NOT EXISTS idx_items_name ON items(json_extract(payload, \'$.Name\'))'
+        )
         conn.execute('PRAGMA journal_mode=WAL')
         conn.commit()
 
@@ -190,6 +196,29 @@ class TreeCache:
     def __iter__(self):
         for row in self._conn().execute('SELECT inode FROM items'):
             yield row[0]
+
+
+    def id_by_filepath(self, filepath: str):
+        """Return the inode/ID of the entry whose FilePath equals *filepath*, or None.
+
+        Uses the json_extract index — O(log N) instead of a full scan.
+        """
+        row = self._conn().execute(
+            "SELECT inode FROM items WHERE json_extract(payload, '$.FilePath')=?",
+            (filepath,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def id_by_name(self, name: str):
+        """Return the inode/ID of the first entry whose Name equals *name*, or None.
+
+        Uses the json_extract index — O(log N) instead of a full scan.
+        """
+        row = self._conn().execute(
+            "SELECT inode FROM items WHERE json_extract(payload, '$.Name')=?",
+            (name,),
+        ).fetchone()
+        return row[0] if row else None
 
     def get(self, inode: int, default=None):
         try:
@@ -667,7 +696,7 @@ class Operations(pyfuse3.Operations):
                 )
             if _no_children:
                 _fetch_dir_if_needed(inode_p, self._mode)
-                self._refresh_path()
+                self._refresh_path(inode_p)
 
         children = self._get_degoo_childs(inode_p)
         attr = None
@@ -703,13 +732,23 @@ class Operations(pyfuse3.Operations):
         return inode
 
     def _get_degoo_id(self, name):
-        folder_id = None
+        """Return the Degoo item ID for *name* (a FilePath or a bare Name).
+
+        Uses the SQLite json_extract indices on FilePath / Name so this is
+        O(log N) instead of the previous O(N) full table scan.  This method
+        is called on every FUSE operation that resolves a path, so the
+        improvement compounds significantly on large trees.
+        """
+        if hasattr(degoo_tree_content, 'id_by_filepath'):
+            if '/' in name:
+                return degoo_tree_content.id_by_filepath(name)
+            return degoo_tree_content.id_by_name(name)
+        # Fallback for non-TreeCache implementations (tests / mocks).
         attr = 'FilePath' if '/' in name else 'Name'
-        for idx, degoo_element in degoo_tree_content.items():
-            if degoo_element[attr] == name:
-                folder_id = degoo_element['ID']
-                break
-        return folder_id
+        for _idx, element in degoo_tree_content.items():
+            if element[attr] == name:
+                return element['ID']
+        return None
 
     def _get_degoo_element(self, name):
         element_id = self._get_degoo_id(name)
@@ -813,7 +852,7 @@ class Operations(pyfuse3.Operations):
 
         if self._mode == 'lazy' and len(children) == 0:
             _fetch_dir_if_needed(parent_id, self._mode)
-            self._refresh_path()
+            self._refresh_path(parent_id)
             children = self._get_degoo_childs(parent_id)
 
         entries = []
@@ -887,7 +926,7 @@ class Operations(pyfuse3.Operations):
 
         if self._mode == 'lazy' and len(self._get_degoo_childs(inode_p_new)) == 0:
             _fetch_dir_if_needed(inode_p_new, self._mode)
-            self._refresh_path()
+            self._refresh_path(inode_p_new)
 
         if inode_p_old == inode_p_new:
             _client.rename(str(inode), name_new)
@@ -1435,18 +1474,36 @@ class Operations(pyfuse3.Operations):
         except FileNotFoundError:
             pass
 
-    def _refresh_path(self):
-        for idx, degoo_element in degoo_tree_content.items():
-            if self._source in degoo_element['FilePath']:
-                attr = self._get_degoo_attrs(degoo_element['FilePath'])
-                inode = attr.st_ino
-                path = degoo_element['FilePath']
+    def _refresh_path(self, parent_id: int = None):
+        """Register inode→path mappings after a lazy directory fetch.
 
+        When *parent_id* is supplied and the cache supports children_of(),
+        only the direct children of that directory are registered — O(children)
+        instead of a full O(N) scan of the entire tree.
+
+        Falls back to the original full-scan behaviour when called without a
+        parent_id (e.g. from load_degoo_content after an eager full fetch).
+        """
+        if parent_id is not None and hasattr(degoo_tree_content, 'children_of'):
+            for entry in degoo_tree_content.children_of(parent_id):
+                path = entry['FilePath']
+                inode = int(entry['ID'])
                 if inode not in self._inode_path_map:
                     self._add_path(inode, path)
-                elif inode in self._inode_path_map and self._inode_path_map[inode] != path:
+                elif self._inode_path_map[inode] != path:
                     del self._inode_path_map[inode]
                     self._add_path(inode, path)
+        else:
+            for _idx, degoo_element in degoo_tree_content.items():
+                if self._source in degoo_element['FilePath']:
+                    attr = self._get_degoo_attrs(degoo_element['FilePath'])
+                    inode = attr.st_ino
+                    path = degoo_element['FilePath']
+                    if inode not in self._inode_path_map:
+                        self._add_path(inode, path)
+                    elif self._inode_path_map[inode] != path:
+                        del self._inode_path_map[inode]
+                        self._add_path(inode, path)
 
     def run_maintenance(self, interval=60, max_chunk_age=3600):
         cease_continuous_run = threading.Event()

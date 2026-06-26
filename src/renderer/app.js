@@ -90,9 +90,15 @@ async function loadSettings() {
   el('sRefresh').value    = settings.refreshIntervalMin || 10;
   el('sDbPath').value     = settings.dbPath           || '';
   el('sChunkDir').value   = settings.chunkCacheDir    || '';
-  const togEl = el('togLaunch');
-  if (settings.startOnLaunch) togEl.classList.add('on');
-  else togEl.classList.remove('on');
+
+  // Toggles
+  const togLaunch = el('togLaunch');
+  if (settings.startOnLaunch) togLaunch.classList.add('on');
+  else togLaunch.classList.remove('on');
+
+  const togAllowOther = el('togAllowOther');
+  if (settings.allowOther) togAllowOther.classList.add('on');
+  else togAllowOther.classList.remove('on');
 
   // About info
   el('infoMount').textContent = settings.mountpoint   || '—';
@@ -201,6 +207,7 @@ el('sSaveBtn').addEventListener('click', async () => {
     dbPath:               el('sDbPath').value.trim(),
     chunkCacheDir:        el('sChunkDir').value.trim(),
     startOnLaunch:        el('togLaunch').classList.contains('on'),
+    allowOther:           el('togAllowOther').classList.contains('on'),
   };
   await window.electronAPI.saveSettings(updated);
   settings = { ...settings, ...updated };
@@ -221,8 +228,9 @@ el('sBrowseMount').addEventListener('click', () => browse('sMountpoint'));
 el('sBrowseDb').addEventListener('click',    () => browse('sDbPath'));
 el('sBrowseChunk').addEventListener('click', () => browse('sChunkDir'));
 
-// Toggle
-el('togLaunch').addEventListener('click', () => el('togLaunch').classList.toggle('on'));
+// Toggles
+el('togLaunch').addEventListener('click',     () => el('togLaunch').classList.toggle('on'));
+el('togAllowOther').addEventListener('click', () => el('togAllowOther').classList.toggle('on'));
 
 // Sign out
 el('signOutBtn').addEventListener('click', async () => {

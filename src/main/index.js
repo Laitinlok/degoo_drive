@@ -16,6 +16,7 @@ const store = new Store({
     downloadThreads: 8, subchunkConnections: 8,
     lookaheadChunks: 2, chunkMaxAge: 3600,
     startOnLaunch: true,
+    allowOther: false,
     dbPath: path.join(app.getPath('home'), '.cache', 'degoo_drive', 'tree_cache.db'),
     chunkCacheDir: path.join(app.getPath('home'), '.cache', 'degoo_drive', 'chunks'),
     storageUsedGb: 0, storageTotalGb: 2048,
@@ -23,6 +24,7 @@ const store = new Store({
 });
 
 let tray = null, mainWin = null, mountProc = null, status = 'stopped';
+let userStopped = false;  // true when stop was explicitly requested by the user
 const LOG_FILE = path.join(app.getPath('userData'), 'degoo-drive.log');
 
 // ── Resolve bundled Python runtime ────────────────────────────────────────
@@ -44,14 +46,9 @@ function detectBundledPyVer() {
 const BUNDLED_PYVER = detectBundledPyVer();
 
 // ── Resolve Python executable ──────────────────────────────────────────────
-// Prefer the shell launcher (degoo_python.sh) which sets PYTHONHOME,
-// PYTHONPATH, and LD_LIBRARY_PATH *before* exec'ing the interpreter.
-// This is more reliable than relying on Node spawn env reaching the
-// dynamic linker in time inside the AppImage squashfs mount.
 const PYTHON_BIN = (() => {
   const launcher = path.join(PYTHON_DIR, 'bin', 'degoo_python.sh');
   if (fs.existsSync(launcher)) return launcher;
-  // Fallback: bare binary (dev mode, system Python)
   const bare = path.join(PYTHON_DIR, 'bin', 'python3');
   if (fs.existsSync(bare)) return bare;
   return 'python3';
@@ -64,15 +61,12 @@ const SCRIPT = (() => {
 })();
 
 // ── Environment for Python subprocess ────────────────────────────────────
-// The launcher script sets the critical vars itself, but we also pass them
-// via env so the bare-binary fallback path works too.
 function getPythonEnv() {
   const env = { ...process.env };
   if (BUNDLED_PYVER) {
     const libBase   = path.join(PYTHON_DIR, 'lib', `python${BUNDLED_PYVER}`);
     const sitePkgs  = path.join(libBase, 'site-packages');
     const sharedLib = path.join(PYTHON_DIR, 'shlib');
-
     env.PYTHONHOME = PYTHON_DIR;
     env.PYTHONPATH = sitePkgs + (process.env.PYTHONPATH ? ':' + process.env.PYTHONPATH : '');
     env.LD_LIBRARY_PATH = sharedLib + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : '');
@@ -104,7 +98,6 @@ function createWindow() {
     minHeight: 520,
     resizable: true,
     title: 'Degoo Drive',
-    // frame: false enables the custom HTML titlebar with -webkit-app-region:drag
     frame: false,
     transparent: false,
     backgroundColor: '#111113',
@@ -118,6 +111,43 @@ function createWindow() {
   mainWin.on('closed', () => { mainWin = null; });
 }
 
+// ── Unmount helper ────────────────────────────────────────────────────────
+// Uses lazy unmount (-uz / -l) so a stale/dead FUSE transport is always
+// detached, preventing the mountpoint from being left as a blank folder.
+function unmount(mountpoint) {
+  const log = (msg) => {
+    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`);
+  };
+
+  // Try fusermount3 -uz then fusermount -uz (lazy detach)
+  for (const bin of ['fusermount3', 'fusermount']) {
+    try {
+      const r = cp.spawnSync(bin, ['-uz', mountpoint], { timeout: 5000 });
+      if (r.status === 0) {
+        log(`unmounted ${mountpoint} via ${bin} -uz`);
+        return;
+      }
+      const err = (r.stderr || Buffer.alloc(0)).toString().trim();
+      if (err) log(`${bin} -uz failed (${r.status}): ${err}`);
+    } catch (e) {
+      // binary not found or timed out — try next
+    }
+  }
+
+  // Last resort: umount -l (lazy, no sudo needed for user-owned FUSE mounts)
+  try {
+    const r = cp.spawnSync('umount', ['-l', mountpoint], { timeout: 5000 });
+    if (r.status === 0) {
+      log(`unmounted ${mountpoint} via umount -l`);
+    } else {
+      const err = (r.stderr || Buffer.alloc(0)).toString().trim();
+      log(`umount -l failed (${r.status}): ${err}`);
+    }
+  } catch (e) {
+    log(`umount -l error: ${e.message}`);
+  }
+}
+
 // ── Mount management ──────────────────────────────────────────────────────
 function startMount() {
   if (mountProc) return;
@@ -129,24 +159,31 @@ function startMount() {
 
   const args = [
     SCRIPT,
-    '--mountpoint',         s.mountpoint,
-    '--degoo-email',        s.email,
-    '--degoo-pass',         s.password,
-    '--degoo-path',         s.degooPath,
-    '--cache-size',         String(s.cacheSizeMb),
-    '--refresh-interval',   String(s.refreshIntervalMin),
-    '--download-threads',   String(s.downloadThreads),
+    '--mountpoint',           s.mountpoint,
+    '--degoo-email',          s.email,
+    '--degoo-pass',           s.password,
+    '--degoo-path',           s.degooPath,
+    '--cache-size',           String(s.cacheSizeMb),
+    '--refresh-interval',     String(s.refreshIntervalMin),
+    '--download-threads',     String(s.downloadThreads),
     '--subchunk-connections', String(s.subchunkConnections),
-    '--lookahead-chunks',   String(s.lookaheadChunks),
-    '--db-path',            s.dbPath,
-    '--chunk-cache-dir',    s.chunkCacheDir,
-    '--chunk-max-age',      String(s.chunkMaxAge),
-    '--allow-other',
+    '--lookahead-chunks',     String(s.lookaheadChunks),
+    '--db-path',              s.dbPath,
+    '--chunk-cache-dir',      s.chunkCacheDir,
+    '--chunk-max-age',        String(s.chunkMaxAge),
   ];
+
+  // Only pass --allow-other when the user has explicitly opted in.
+  // FUSE aborts with a fatal error when allow_other is requested but
+  // user_allow_other is absent from /etc/fuse.conf / /etc/fuse3.conf.
+  if (s.allowOther) {
+    args.push('--allow-other');
+  }
 
   const log = fs.createWriteStream(LOG_FILE, { flags: 'a' });
   log.write(`\n[${new Date().toISOString()}] Starting: ${PYTHON_BIN} ${args.join(' ')}\n`);
 
+  userStopped = false;
   mountProc = cp.spawn(PYTHON_BIN, args, {
     detached: false,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -155,16 +192,29 @@ function startMount() {
   mountProc.stdout.pipe(log);
   mountProc.stderr.pipe(log);
   mountProc.on('spawn', () => setStatus('running'));
-  mountProc.on('exit',  (code) => {
+  mountProc.on('exit', (code) => {
     mountProc = null;
-    setStatus(code === 0 ? 'stopped' : 'error');
+    // If the user explicitly requested stop, always treat as stopped
+    // regardless of exit code (SIGTERM = -15, SIGKILL = -9, or any other).
+    if (userStopped) {
+      setStatus('stopped');
+    } else {
+      setStatus(code === 0 ? 'stopped' : 'error');
+    }
   });
 }
 
 function stopMount() {
   if (!mountProc) return;
+  userStopped = true;
+  const mountpoint = store.get('mountpoint');
   mountProc.kill('SIGTERM');
-  setTimeout(() => { if (mountProc) mountProc.kill('SIGKILL'); }, 5000);
+  // Force-unmount after a short delay so the kernel releases the mountpoint
+  // even if the process exits uncleanly (stale transport endpoint).
+  setTimeout(() => {
+    if (mountProc) mountProc.kill('SIGKILL');
+    unmount(mountpoint);
+  }, 3000);
 }
 
 function setStatus(s) {
@@ -199,20 +249,15 @@ ipcMain.handle('get-settings',  ()     => store.store);
 ipcMain.handle('get-status',    ()     => status);
 
 ipcMain.handle('save-settings', (_, d) => {
-  // Handle _action signals from renderer
   const action = d._action;
   delete d._action;
-
-  // Only persist non-empty keys
   const toSave = Object.fromEntries(
     Object.entries(d).filter(([, v]) => v !== undefined)
   );
   store.set(toSave);
-
   if (action === 'stop') {
     stopMount();
   } else if (status === 'running') {
-    // Settings changed while mounted — restart
     stopMount();
     setTimeout(startMount, 2000);
   } else if (toSave.email && toSave.password && store.get('startOnLaunch')) {
@@ -241,5 +286,5 @@ app.whenReady().then(() => {
   createWindow();
   if (store.get('startOnLaunch') && store.get('email')) setTimeout(startMount, 1200);
 });
-app.on('window-all-closed', e => e.preventDefault()); // keep in tray
+app.on('window-all-closed', e => e.preventDefault());
 app.on('before-quit', stopMount);

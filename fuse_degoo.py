@@ -911,6 +911,27 @@ class Operations(pyfuse3.Operations):
         else:
             del self._inode_path_map[inode]
 
+    def _update_children_filepath(self, dir_id: int, old_prefix: str, new_prefix: str) -> None:
+        """Recursively rewrite FilePath for all descendants of *dir_id* in the
+        tree cache after a folder rename or move.
+
+        Without this, any lookup/readdir under the renamed folder will keep
+        resolving the stale old FilePath and return ENOENT even though the
+        folder itself was moved successfully on the Degoo backend.
+        """
+        for child in list(self._get_degoo_childs(dir_id)):
+            child_id = int(child['ID'])
+            old_fp = child['FilePath']
+            if old_fp.startswith(old_prefix):
+                new_fp = new_prefix + old_fp[len(old_prefix):]
+                child['FilePath'] = new_fp
+                degoo_tree_content[child_id] = child
+                # Update the in-memory inode→path map as well.
+                if child_id in self._inode_path_map:
+                    self._inode_path_map[child_id] = new_fp
+            if child.get('isFolder'):
+                self._update_children_filepath(child_id, old_prefix, new_prefix)
+
     async def rename(self, inode_p_old, name_old, inode_p_new, name_new,
                      flags, ctx):
         if flags != 0:
@@ -937,6 +958,9 @@ class Operations(pyfuse3.Operations):
                 entry['Name'] = name_new
                 entry['FilePath'] = new_fp
                 degoo_tree_content[inode] = entry  # write back to DB
+                # FIX: update all descendants' cached FilePaths
+                if entry.get('isFolder'):
+                    self._update_children_filepath(inode, old_fp, new_fp)
         else:
             if name_old != name_new:
                 _client.rename(str(inode), name_new)
@@ -947,11 +971,15 @@ class Operations(pyfuse3.Operations):
             _client.move([str(inode)], str(inode_p_new))
             if inode in degoo_tree_content:
                 entry = degoo_tree_content[inode]
+                old_fp = entry['FilePath']
                 new_parent_path = self._inode_to_path(inode_p_new, fullpath=True)
                 new_fp = new_parent_path.rstrip('/') + '/' + name_new
                 entry['FilePath'] = new_fp
                 entry['ParentID'] = inode_p_new
                 degoo_tree_content[inode] = entry
+                # FIX: update all descendants' cached FilePaths
+                if entry.get('isFolder'):
+                    self._update_children_filepath(inode, old_fp, new_fp)
 
         path_new = self._inode_to_path(inode_p_new, fullpath=True).rstrip('/') + '/' + name_new
 
@@ -969,9 +997,14 @@ class Operations(pyfuse3.Operations):
         base_path = self._inode_to_path(inode_p, fullpath=True)
         element_id = self._get_degoo_id(base_path)
 
+        # FIX: if the path isn't in the cache yet (lazy mode / unmapped inode),
+        # fall back to using inode_p directly as the Degoo parent ID.
         if element_id is None:
-            log.debug('mkdir: cannot resolve parent inode %d (path=%s)', inode_p, base_path)
-            raise FUSEError(errno.ENOENT)
+            log.debug(
+                'mkdir: path %s not in cache, falling back to inode_p=%d as parent ID',
+                base_path, inode_p,
+            )
+            element_id = inode_p
 
         log.debug("Creating directory '%s' in Degoo path '%s' (id=%s)", name, base_path, element_id)
 
@@ -981,8 +1014,21 @@ class Operations(pyfuse3.Operations):
             log.debug('mkdir API error for %s in %s: %s', name, base_path, exc)
             raise FUSEError(errno.EIO)
 
-        new_dir_item = _client.resolve_path_under(str(element_id), name)
+        # FIX: resolve the newly created directory by scanning the parent's
+        # children via list_dir instead of relying on resolve_path_under(),
+        # which may not be implemented on all cligoo backends.
+        new_dir_item = None
+        try:
+            children = _client.list_dir(str(element_id), limit=None)
+            for child in children:
+                if child.get('Name') == name and _client.is_folder(child):
+                    new_dir_item = child
+                    break
+        except DegooAPIError as exc:
+            log.debug('mkdir: list_dir failed after mkdir for %s: %s', name, exc)
+
         if not new_dir_item:
+            log.debug('mkdir: could not find newly created dir %s under %s', name, element_id)
             raise FUSEError(errno.EIO)
 
         parent_entry = degoo_tree_content.get(element_id)
@@ -1147,66 +1193,99 @@ class Operations(pyfuse3.Operations):
         os.lseek(fd, offset, os.SEEK_SET)
         length = os.write(fd, buf)
 
+        # Track how many bytes have been written so release() knows the file
+        # is non-empty and should be uploaded.
         if fd not in self._fd_buffer_length:
-            self._fd_buffer_length[fd] = length
-
-        if length != self._fd_buffer_length[fd]:
-            inode = self._fd_inode_map[fd]
-            source_file = self._inode_to_path(inode, fullpath=True)
-            filename = source_file[source_file.rfind('/') + 1:]
-
-            target_path = self._degoo_path[inode]
-            log.debug('Uploading file [%s] to Degoo path [%s]', filename, target_path)
-
-            try:
-                target_id = self._get_degoo_id(target_path)
-                file_id = _client.upload(source_file, str(target_id), name=filename)
-
-                new_item = _client.resolve_path_under(str(target_id), filename)
-                if new_item:
-                    parent_entry = degoo_tree_content.get(target_id)
-                    p_path = parent_entry['FilePath'] if parent_entry else target_path
-                    new_entry = _cligoo_item_to_tree(new_item, p_path)
-                    degoo_tree_content[new_entry['ID']] = new_entry
-                    path = new_entry['FilePath']
-                    url = new_entry.get('URL', '')
-                else:
-                    path = target_path.rstrip('/') + '/' + filename
-                    url = ''
-
-                log.debug('Upload of file [%s] finished. Id [%s] Url [%s]', filename, file_id, url)
-
-                if not url:
-                    log.debug('WARN: file [%s] has not been uploaded successfully', filename)
-
-                attr = self._get_degoo_attrs(path)
-                self._add_path(attr.st_ino, path)
-            except DegooAPIError as e:
-                log.debug('ERROR uploading file [{}]: {}'.format(filename, str(e)))
+            self._fd_buffer_length[fd] = 0
+        self._fd_buffer_length[fd] += length
 
         return length
 
-    async def release(self, fd):
-        try:
-            element = self._get_degoo_element_by_id(fd)
-            filename = self._get_filename(element['FilePath'])
+    def _do_upload(self, fd):
+        """Upload the temp file associated with *fd* to Degoo.
 
-            if self._plex_split_file:
-                fd_new_part = self._get_next_part_split_file(element['FilePath'])
-                if fd_new_part:
-                    log.debug('Skipping release file part of file %s', filename)
-                    return
-
-            log.debug('Releasing file %s', filename)
-            self._clear_upload_temp(element['FilePath'])
-
+        Called from release() once the kernel has finished writing all data.
+        Separated into its own method so it can be unit-tested independently.
+        """
+        inode = self._fd_inode_map.get(fd)
+        if inode is None:
             return
-        except Exception:
-            pass
 
-        # Guard: pyfuse3/Trio can deliver a release callback for an fd that has
-        # already been cleaned up (duplicate release or race during teardown).
-        # Treat it as a no-op rather than raising KeyError and crashing the mount.
+        source_file = self._inode_to_path(inode, fullpath=True)
+        filename = source_file[source_file.rfind('/') + 1:]
+        target_path = self._degoo_path.get(inode)
+
+        if not target_path:
+            log.debug('_do_upload: no target_path for inode %d', inode)
+            return
+
+        if not os.path.isfile(source_file):
+            log.debug('_do_upload: temp file missing for %s', filename)
+            return
+
+        log.debug('Uploading file [%s] to Degoo path [%s]', filename, target_path)
+
+        try:
+            target_id = self._get_degoo_id(target_path)
+            if target_id is None:
+                log.debug('_do_upload: cannot resolve target path %s', target_path)
+                return
+
+            _client.upload(source_file, str(target_id), name=filename)
+
+            # Refresh the tree cache entry for the newly uploaded file.
+            try:
+                children = _client.list_dir(str(target_id), limit=None)
+                new_item = next(
+                    (c for c in children if c.get('Name') == filename and not _client.is_folder(c)),
+                    None,
+                )
+            except DegooAPIError:
+                new_item = None
+
+            if new_item:
+                parent_entry = degoo_tree_content.get(target_id)
+                p_path = parent_entry['FilePath'] if parent_entry else target_path
+                new_entry = _cligoo_item_to_tree(new_item, p_path)
+                degoo_tree_content[new_entry['ID']] = new_entry
+                path = new_entry['FilePath']
+                url = new_entry.get('URL', '')
+            else:
+                path = target_path.rstrip('/') + '/' + filename
+                url = ''
+
+            log.debug('Upload of file [%s] finished. Url [%s]', filename, url)
+            if not url:
+                log.debug('WARN: file [%s] may not have uploaded successfully', filename)
+
+            attr = self._get_degoo_attrs(path)
+            self._add_path(attr.st_ino, path)
+
+        except DegooAPIError as e:
+            log.debug('ERROR uploading file [%s]: %s', filename, str(e))
+
+    async def release(self, fd):
+        # ------------------------------------------------------------------
+        # FIX: perform the Degoo upload here, unconditionally, once the
+        # kernel signals the file is fully written (i.e. all write() calls
+        # have completed).  The old approach triggered the upload inside
+        # write() only when the chunk length changed, which missed small
+        # files and files written in uniform-sized chunks (the common case
+        # for cp -r / recursive folder copies).
+        # ------------------------------------------------------------------
+        inode = self._fd_inode_map.get(fd)
+        if inode is not None and fd in self._fd_buffer_length and self._fd_buffer_length[fd] > 0:
+            # Only upload if this fd belongs to a write-open file (has a
+            # degoo_path) rather than a read-only open.
+            if inode in self._degoo_path:
+                try:
+                    self._do_upload(fd)
+                except Exception as exc:
+                    log.debug('release: upload error for fd %d: %s', fd, exc)
+
+        # ------------------------------------------------------------------
+        # Standard fd / inode cleanup
+        # ------------------------------------------------------------------
         if fd not in self._fd_open_count:
             log.debug('release: fd %s already released; ignoring duplicate', fd)
             return
@@ -1222,6 +1301,8 @@ class Operations(pyfuse3.Operations):
         inode = self._fd_inode_map.pop(fd, None)
         if inode is not None:
             self._inode_fd_map.pop(inode, None)
+            self._degoo_path.pop(inode, None)
+
         try:
             os.close(fd)
         except OSError as exc:

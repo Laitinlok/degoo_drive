@@ -8,5 +8,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   browseFolder: ()    => ipcRenderer.invoke('browse-folder'),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
   openFolder:   (p)   => ipcRenderer.invoke('open-folder', p),
-  onStatus: (cb)      => ipcRenderer.on('status', cb),
+  onStatus: (cb)      => {
+    const listener = (_event, status) => cb(status);
+    ipcRenderer.on('status', listener);
+    return () => ipcRenderer.removeListener('status', listener);
+  },
 });

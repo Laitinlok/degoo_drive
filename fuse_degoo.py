@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from argparse import ArgumentParser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -601,6 +602,7 @@ class Operations(pyfuse3.Operations):
         self._fd_open_count = dict()
         self._degoo_path = dict()
         self._fd_buffer_length = dict()
+        self._fd_upload_name = dict()
         self._cache_size = cache_size
         self._min_size_read_next_part = (percentage_read * self._cache_size) / 100
         self._flood_sleep_time = flood_sleep_time
@@ -1009,23 +1011,29 @@ class Operations(pyfuse3.Operations):
         log.debug("Creating directory '%s' in Degoo path '%s' (id=%s)", name, base_path, element_id)
 
         try:
-            _client.mkdir(name, str(element_id))
+            created = _client.mkdir(name, str(element_id))
         except DegooAPIError as exc:
             log.debug('mkdir API error for %s in %s: %s', name, base_path, exc)
             raise FUSEError(errno.EIO)
 
-        # FIX: resolve the newly created directory by scanning the parent's
-        # children via list_dir instead of relying on resolve_path_under(),
-        # which may not be implemented on all cligoo backends.
-        new_dir_item = None
-        try:
-            children = _client.list_dir(str(element_id), limit=None)
-            for child in children:
-                if child.get('Name') == name and _client.is_folder(child):
-                    new_dir_item = child
-                    break
-        except DegooAPIError as exc:
-            log.debug('mkdir: list_dir failed after mkdir for %s: %s', name, exc)
+        # Prefer a concrete item returned by cligoo, but do not depend on it:
+        # some cligoo versions return None/boolean for mkdir.  Degoo can also
+        # be eventually consistent, so retry the parent listing briefly before
+        # reporting failure to FUSE.
+        new_dir_item = created if isinstance(created, dict) else None
+        if new_dir_item is None:
+            for attempt in range(6):
+                try:
+                    children = _client.list_dir(str(element_id), limit=None)
+                    for child in children:
+                        if child.get('Name') == name and _client.is_folder(child):
+                            new_dir_item = child
+                            break
+                    if new_dir_item is not None:
+                        break
+                except DegooAPIError as exc:
+                    log.debug('mkdir: list_dir failed after mkdir for %s: %s', name, exc)
+                time.sleep(0.5 * (attempt + 1))
 
         if not new_dir_item:
             log.debug('mkdir: could not find newly created dir %s under %s', name, element_id)
@@ -1046,19 +1054,26 @@ class Operations(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=inode)
 
     async def create(self, inode_p, name, mode, flags, ctx):
-        path = os.path.join(self._get_temp_directory(), fsdecode(name))
+        upload_name = fsdecode(name)
+        temp_dir = self._get_temp_directory()
+
+        # Use a unique staging file for every FUSE create().  Recursive folder
+        # copies often contain repeated basenames such as "index.html" or
+        # "README.md" in different subdirectories; staging by basename alone
+        # lets concurrent copies overwrite each other's temporary files.
+        path = os.path.join(temp_dir, f'degoo-upload-{uuid.uuid4().hex}.tmp')
         try:
-            if os.path.exists(path):
-                os.remove(path)
-            fd = os.open(path, flags | os.O_CREAT | os.O_TRUNC)
+            fd = os.open(path, flags | os.O_CREAT | os.O_EXCL | os.O_TRUNC, mode)
         except OSError as exc:
-            raise FUSEError(exc.exc)
+            raise FUSEError(exc.errno)
+
         attr = self._getattr(fd=fd)
         self._add_path(attr.st_ino, path)
         self._inode_fd_map[attr.st_ino] = fd
         self._fd_inode_map[fd] = attr.st_ino
         self._fd_open_count[fd] = 1
         self._degoo_path[attr.st_ino] = self._inode_to_path(inode_p, fullpath=True)
+        self._fd_upload_name[fd] = upload_name
         return pyfuse3.FileInfo(fh=fd, direct_io=True), attr
 
     async def read(self, fd, offset, length):
@@ -1097,48 +1112,45 @@ class Operations(pyfuse3.Operations):
         self.check_and_split_file(path_file)
 
         # ---------------------------------------------------------------
-        # Serve the bytes from the already-downloaded chunk
+        # Serve the bytes from one or more downloaded chunks.
         # ---------------------------------------------------------------
-        result = (offset // self._cache_size)
-        size_to_read = offset + length
-        second_file_part = first_file_part + 1
-        next_temp_filename = self._chunk_cache.chunk_path(item_id, second_file_part)
+        remaining = min(length, max(0, int(degoo_file_size) - offset))
+        if remaining <= 0:
+            return b''
 
-        if not os.path.isfile(temp_filename):
-            raise pyfuse3.FUSEError(errno.ENOENT)
+        data = bytearray()
+        current_offset = offset
 
-        file_descriptor = os.open(temp_filename, os.O_RDONLY)
-        if offset - (result * self._cache_size) >= 0:
-            os.lseek(file_descriptor, offset - (result * self._cache_size), os.SEEK_SET)
-            byte = os.read(file_descriptor, length)
-            os.close(file_descriptor)
-        else:
-            log.debug('Reading first part from two files. File 1 [%s]', temp_filename)
+        while remaining > 0:
+            part = current_offset // self._cache_size
+            chunk_path = self._chunk_cache.chunk_path(item_id, part)
 
-            part_offset = self._cache_size - ((result * self._cache_size) - offset)
-            os.lseek(file_descriptor, part_offset, os.SEEK_SET)
-            byte = os.read(file_descriptor, self._cache_size - length)
-            os.close(file_descriptor)
+            if not self._chunk_cache.exists(item_id, part):
+                self._check_requests()
+                self._download_executor.submit(
+                    self._cache_file, path_file, part, degoo_file_size).result()
+            else:
+                self._chunk_cache.touch(item_id, part)
 
-            log.debug('Reading second part from two files. File 2 [%s]', next_temp_filename)
-
-            self._clear_files(path_file, skip_item_id=item_id, skip_part=second_file_part)
-
-            retries = 0
-            while next_temp_filename in caching_file_list and retries < 10:
-                log.debug('Waiting to read second part file [%s]', next_temp_filename)
-                retries += 1
-                time.sleep(0.5)
-
-            if not os.path.isfile(next_temp_filename):
+            if not os.path.isfile(chunk_path):
                 raise pyfuse3.FUSEError(errno.ENOENT)
 
-            file_descriptor = os.open(next_temp_filename, os.O_RDONLY)
-            os.lseek(file_descriptor, 0, os.SEEK_SET)
-            byte += os.read(file_descriptor, length - len(byte))
-            os.close(file_descriptor)
+            chunk_offset = current_offset - (part * self._cache_size)
+            to_read = min(remaining, self._cache_size - chunk_offset)
+            file_descriptor = os.open(chunk_path, os.O_RDONLY)
+            try:
+                os.lseek(file_descriptor, chunk_offset, os.SEEK_SET)
+                data.extend(os.read(file_descriptor, to_read))
+            finally:
+                os.close(file_descriptor)
 
-        return byte
+            bytes_read = len(data) - (length - remaining)
+            if bytes_read <= 0:
+                break
+            remaining -= bytes_read
+            current_offset += bytes_read
+
+        return bytes(data)
 
     def check_and_split_file(self, path_file):
         if self._plex_split_file:
@@ -1193,13 +1205,29 @@ class Operations(pyfuse3.Operations):
         os.lseek(fd, offset, os.SEEK_SET)
         length = os.write(fd, buf)
 
-        # Track how many bytes have been written so release() knows the file
-        # is non-empty and should be uploaded.
         if fd not in self._fd_buffer_length:
             self._fd_buffer_length[fd] = 0
         self._fd_buffer_length[fd] += length
 
         return length
+
+    async def flush(self, fd):
+        # Many copy tools call flush()/fsync() before release().  The upload is
+        # intentionally still performed in release(), because only release()
+        # reliably means all writes for this handle are complete.
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
+
+    async def fsync(self, fd, datasync):
+        try:
+            if hasattr(os, 'fdatasync') and datasync:
+                os.fdatasync(fd)
+            else:
+                os.fsync(fd)
+        except OSError as exc:
+            raise FUSEError(exc.errno)
 
     def _do_upload(self, fd):
         """Upload the temp file associated with *fd* to Degoo.
@@ -1212,7 +1240,7 @@ class Operations(pyfuse3.Operations):
             return
 
         source_file = self._inode_to_path(inode, fullpath=True)
-        filename = source_file[source_file.rfind('/') + 1:]
+        filename = self._fd_upload_name.get(fd, source_file[source_file.rfind('/') + 1:])
         target_path = self._degoo_path.get(inode)
 
         if not target_path:
@@ -1231,17 +1259,25 @@ class Operations(pyfuse3.Operations):
                 log.debug('_do_upload: cannot resolve target path %s', target_path)
                 return
 
-            _client.upload(source_file, str(target_id), name=filename)
+            uploaded = _client.upload(source_file, str(target_id), name=filename)
 
-            # Refresh the tree cache entry for the newly uploaded file.
-            try:
-                children = _client.list_dir(str(target_id), limit=None)
-                new_item = next(
-                    (c for c in children if c.get('Name') == filename and not _client.is_folder(c)),
-                    None,
-                )
-            except DegooAPIError:
-                new_item = None
+            # Refresh the tree cache entry for the newly uploaded file.  Some
+            # cligoo versions return the uploaded item; others return a status
+            # value, and Degoo may need a short time before list_dir shows it.
+            new_item = uploaded if isinstance(uploaded, dict) else None
+            if new_item is None:
+                for attempt in range(6):
+                    try:
+                        children = _client.list_dir(str(target_id), limit=None)
+                        new_item = next(
+                            (c for c in children if c.get('Name') == filename and not _client.is_folder(c)),
+                            None,
+                        )
+                        if new_item is not None:
+                            break
+                    except DegooAPIError as exc:
+                        log.debug('_do_upload: list_dir failed after upload for %s: %s', filename, exc)
+                    time.sleep(0.5 * (attempt + 1))
 
             if new_item:
                 parent_entry = degoo_tree_content.get(target_id)
@@ -1250,42 +1286,19 @@ class Operations(pyfuse3.Operations):
                 degoo_tree_content[new_entry['ID']] = new_entry
                 path = new_entry['FilePath']
                 url = new_entry.get('URL', '')
+                attr = self._get_degoo_attrs(path)
+                self._add_path(attr.st_ino, path)
+                log.debug('Upload of file [%s] finished. Url [%s]', filename, url)
             else:
-                path = target_path.rstrip('/') + '/' + filename
-                url = ''
-
-            log.debug('Upload of file [%s] finished. Url [%s]', filename, url)
-            if not url:
-                log.debug('WARN: file [%s] may not have uploaded successfully', filename)
-
-            attr = self._get_degoo_attrs(path)
-            self._add_path(attr.st_ino, path)
+                log.debug(
+                    'Upload of file [%s] finished, but the new item was not visible in list_dir yet',
+                    filename,
+                )
 
         except DegooAPIError as e:
             log.debug('ERROR uploading file [%s]: %s', filename, str(e))
 
     async def release(self, fd):
-        # ------------------------------------------------------------------
-        # FIX: perform the Degoo upload here, unconditionally, once the
-        # kernel signals the file is fully written (i.e. all write() calls
-        # have completed).  The old approach triggered the upload inside
-        # write() only when the chunk length changed, which missed small
-        # files and files written in uniform-sized chunks (the common case
-        # for cp -r / recursive folder copies).
-        # ------------------------------------------------------------------
-        inode = self._fd_inode_map.get(fd)
-        if inode is not None and fd in self._fd_buffer_length and self._fd_buffer_length[fd] > 0:
-            # Only upload if this fd belongs to a write-open file (has a
-            # degoo_path) rather than a read-only open.
-            if inode in self._degoo_path:
-                try:
-                    self._do_upload(fd)
-                except Exception as exc:
-                    log.debug('release: upload error for fd %d: %s', fd, exc)
-
-        # ------------------------------------------------------------------
-        # Standard fd / inode cleanup
-        # ------------------------------------------------------------------
         if fd not in self._fd_open_count:
             log.debug('release: fd %s already released; ignoring duplicate', fd)
             return
@@ -1294,9 +1307,27 @@ class Operations(pyfuse3.Operations):
             self._fd_open_count[fd] -= 1
             return
 
+        inode = self._fd_inode_map.get(fd)
+        source_file = None
+        if inode is not None:
+            try:
+                source_file = self._inode_to_path(inode, fullpath=True)
+            except FUSEError:
+                source_file = None
+
+        # Upload exactly once, when the last reference to this created handle is
+        # released.  This also uploads zero-byte files, which are common in
+        # copied project folders and were previously skipped because no write()
+        # call increased _fd_buffer_length.
+        if inode is not None and inode in self._degoo_path:
+            try:
+                self._do_upload(fd)
+            except Exception as exc:
+                log.debug('release: upload error for fd %d: %s', fd, exc)
+
         self._fd_open_count.pop(fd, None)
-        if fd in self._fd_buffer_length:
-            del self._fd_buffer_length[fd]
+        self._fd_buffer_length.pop(fd, None)
+        self._fd_upload_name.pop(fd, None)
 
         inode = self._fd_inode_map.pop(fd, None)
         if inode is not None:
@@ -1309,15 +1340,15 @@ class Operations(pyfuse3.Operations):
             raise FUSEError(exc.errno)
 
         if inode is not None:
-            source_file = self._inode_to_path(inode, fullpath=True)
             try:
                 del self._inode_path_map[inode]
             except KeyError:
                 pass
-            try:
-                os.remove(source_file)
-            except FileNotFoundError:
-                pass
+            if source_file:
+                try:
+                    os.remove(source_file)
+                except FileNotFoundError:
+                    pass
 
     def _check_requests(self):
         if self._enable_flood_control:
@@ -1478,6 +1509,7 @@ class Operations(pyfuse3.Operations):
                     os.remove(leftover)
                 except FileNotFoundError:
                     pass
+            raise
         finally:
             caching_file_list_remove(caching_file_list, chunk_path)
 
@@ -1609,7 +1641,10 @@ class Operations(pyfuse3.Operations):
         while is_refresh_enabled:
             time.sleep(refresh_interval)
             log.debug('Loading Degoo content')
-            self.load_degoo_content()
+            try:
+                self.load_degoo_content()
+            except Exception as exc:
+                log.warning('Refresh content failed; will retry later: %s', exc)
         log.debug('Refresh content finished')
 
     def load_degoo_content(self):
@@ -1711,11 +1746,11 @@ def parse_args(args):
                         help='Refresh degoo content interval (default: 10 * 60sec)')
     parser.add_argument('--disable-refresh', action='store_true', default=False,
                         help='Disable automatic refresh')
-    parser.add_argument('--flood-sleep-time', action='store_true', default=60,
+    parser.add_argument('--flood-sleep-time', type=int, default=60,
                         help='Waiting time, in seconds, before resuming requests once the maximum has been reached')
-    parser.add_argument('--flood-max-requests', action='store_true', default=20,
+    parser.add_argument('--flood-max-requests', type=int, default=20,
                         help='Maximum number of requests in the period')
-    parser.add_argument('--flood-time-to-check', action='store_true', default=1,
+    parser.add_argument('--flood-time-to-check', type=int, default=1,
                         help='Request control period, in minutes')
     parser.add_argument('--enable-flood-control', action='store_true', default=False,
                         help='Enable flood control')
@@ -1770,8 +1805,8 @@ def main():
     init_logging(options.debug)
 
     cache_size = options.cache_size * 1024 * 1024
-    degoo_email = options.degoo_email
-    degoo_pass = options.degoo_pass
+    degoo_email = options.degoo_email or os.environ.get('DEGOO_EMAIL')
+    degoo_pass = options.degoo_pass or os.environ.get('DEGOO_PASSWORD')
     degoo_refresh_token = options.degoo_refresh_token
     degoo_path = options.degoo_path
     refresh_interval = options.refresh_interval * 60

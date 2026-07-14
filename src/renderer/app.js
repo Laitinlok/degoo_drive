@@ -164,14 +164,28 @@ function logActivity(msg, type = 'ok') {
 function renderActivity() {
   const list  = el('activityList');
   const empty = el('activityEmpty');
+  list.querySelectorAll('.activity-item').forEach(item => item.remove());
   if (!activityLog.length) { empty.style.display = 'block'; return; }
   empty.style.display = 'none';
-  list.innerHTML = activityLog.map(e => `
-    <div class="activity-item">
-      <div class="act-dot${e.type === 'err' ? ' err' : e.type === 'warn' ? ' warn' : ''}"></div>
-      <div class="act-msg">${e.msg}</div>
-      <div class="act-time">${e.time}</div>
-    </div>`).join('') + `<div class="activity-empty" id="activityEmpty" style="display:none">No recent activity</div>`;
+
+  for (const entry of activityLog) {
+    const item = document.createElement('div');
+    item.className = 'activity-item';
+
+    const dot = document.createElement('div');
+    dot.className = 'act-dot' + (entry.type === 'err' ? ' err' : entry.type === 'warn' ? ' warn' : '');
+
+    const msg = document.createElement('div');
+    msg.className = 'act-msg';
+    msg.textContent = entry.msg;
+
+    const time = document.createElement('div');
+    time.className = 'act-time';
+    time.textContent = entry.time;
+
+    item.append(dot, msg, time);
+    list.insertBefore(item, empty);
+  }
 }
 
 // ── Mount button ─────────────────────────────────────────
@@ -255,16 +269,22 @@ el('addBackupBtn').addEventListener('click', async () => {
   const card = document.createElement('div');
   card.className = 'backup-card';
   const name = p.split('/').pop() || p;
-  card.innerHTML = `
-    <div class="bc-name">${name}</div>
-    <div class="bc-path">${p}</div>
-    <div class="bc-status">Active</div>`;
+  const nameEl = document.createElement('div');
+  nameEl.className = 'bc-name';
+  nameEl.textContent = name;
+  const pathEl = document.createElement('div');
+  pathEl.className = 'bc-path';
+  pathEl.textContent = p;
+  const statusEl = document.createElement('div');
+  statusEl.className = 'bc-status';
+  statusEl.textContent = 'Active';
+  card.append(nameEl, pathEl, statusEl);
   el('addBackupBtn').insertAdjacentElement('beforebegin', card);
   logActivity('Backup added: ' + name, 'ok');
 });
 
 // ── Status listener from main process ───────────────────
-window.electronAPI.onStatus((_, s) => {
+window.electronAPI.onStatus((s) => {
   renderStatus(s);
   logActivity(s === 'running' ? 'Mount started' : s === 'error' ? 'Mount error — check logs' : 'Mount stopped', s === 'error' ? 'err' : s === 'running' ? 'ok' : 'warn');
 });

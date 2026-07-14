@@ -1,6 +1,6 @@
 const {
   app, BrowserWindow, Tray, Menu, nativeImage,
-  ipcMain, shell, dialog, Notification
+  ipcMain, shell, dialog, Notification, safeStorage
 } = require('electron');
 const path  = require('path');
 const fs    = require('fs');
@@ -9,7 +9,7 @@ const Store = require('electron-store');
 
 const store = new Store({
   defaults: {
-    email: '', password: '',
+    email: '', password: '', passwordEncrypted: '',
     mountpoint: path.join(app.getPath('home'), 'Degoo'),
     degooPath: '/',
     cacheSizeMb: 128, refreshIntervalMin: 10,
@@ -26,6 +26,83 @@ const store = new Store({
 let tray = null, mainWin = null, mountProc = null, status = 'stopped';
 let userStopped = false;  // true when stop was explicitly requested by the user
 const LOG_FILE = path.join(app.getPath('userData'), 'degoo-drive.log');
+const ALLOWED_EXTERNAL_URLS = new Set([
+  'https://app.degoo.com/',
+  'https://degoo.com/',
+  'https://github.com/Laitinlok/degoo_drive',
+]);
+
+function encryptPassword(password) {
+  if (!password) return '';
+  if (!safeStorage.isEncryptionAvailable()) return '';
+  return safeStorage.encryptString(password).toString('base64');
+}
+
+function decryptPassword(ciphertext) {
+  if (!ciphertext || !safeStorage.isEncryptionAvailable()) return '';
+  try {
+    return safeStorage.decryptString(Buffer.from(ciphertext, 'base64'));
+  } catch (e) {
+    return '';
+  }
+}
+
+function getStoredSettings() {
+  const s = { ...store.store };
+  s.password = decryptPassword(s.passwordEncrypted) || s.password || '';
+  return s;
+}
+
+function prepareSettingsForSave(data) {
+  const next = { ...data };
+  if (Object.prototype.hasOwnProperty.call(next, 'password')) {
+    const encrypted = encryptPassword(next.password);
+    if (encrypted) {
+      next.passwordEncrypted = encrypted;
+      next.password = '';
+    }
+  }
+  return next;
+}
+
+function redactArgs(args) {
+  const redacted = [];
+  for (let i = 0; i < args.length; i += 1) {
+    redacted.push(args[i]);
+    if (args[i] === '--degoo-pass' && i + 1 < args.length) {
+      redacted.push('<redacted>');
+      i += 1;
+    }
+  }
+  return redacted;
+}
+
+function isPathInside(childPath, parentPath) {
+  if (!childPath || !parentPath) return false;
+  const child = path.resolve(childPath);
+  const parent = path.resolve(parentPath);
+  return child === parent || child.startsWith(parent + path.sep);
+}
+
+function openAllowedExternal(url) {
+  if (url === 'logs') return shell.openPath(LOG_FILE);
+  let normalized;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return Promise.resolve('Blocked non-HTTPS URL');
+    normalized = parsed.toString();
+  } catch (e) {
+    return Promise.resolve('Blocked invalid URL');
+  }
+  if (!ALLOWED_EXTERNAL_URLS.has(normalized)) return Promise.resolve('Blocked unapproved URL');
+  return shell.openExternal(normalized);
+}
+
+function openAllowedFolder(folderPath) {
+  const mountpoint = store.get('mountpoint');
+  if (!isPathInside(folderPath, mountpoint)) return Promise.resolve('Blocked unapproved path');
+  return shell.openPath(folderPath);
+}
 
 // ── Resolve bundled Python runtime ────────────────────────────────────────
 const RESOURCES = app.isPackaged ? process.resourcesPath : path.join(__dirname, '..', '..');
@@ -151,7 +228,7 @@ function unmount(mountpoint) {
 // ── Mount management ──────────────────────────────────────────────────────
 function startMount() {
   if (mountProc) return;
-  const s = store.store;
+  const s = getStoredSettings();
   if (!s.email || !s.password) { createWindow(); return; }
   fs.mkdirSync(s.mountpoint,            { recursive: true });
   fs.mkdirSync(path.dirname(s.dbPath),  { recursive: true });
@@ -160,8 +237,6 @@ function startMount() {
   const args = [
     SCRIPT,
     '--mountpoint',           s.mountpoint,
-    '--degoo-email',          s.email,
-    '--degoo-pass',           s.password,
     '--degoo-path',           s.degooPath,
     '--cache-size',           String(s.cacheSizeMb),
     '--refresh-interval',     String(s.refreshIntervalMin),
@@ -181,13 +256,18 @@ function startMount() {
   }
 
   const log = fs.createWriteStream(LOG_FILE, { flags: 'a' });
-  log.write(`\n[${new Date().toISOString()}] Starting: ${PYTHON_BIN} ${args.join(' ')}\n`);
+  const env = {
+    ...getPythonEnv(),
+    DEGOO_EMAIL: s.email,
+    DEGOO_PASSWORD: s.password,
+  };
+  log.write(`\n[${new Date().toISOString()}] Starting: ${PYTHON_BIN} ${redactArgs(args).join(' ')}\n`);
 
   userStopped = false;
   mountProc = cp.spawn(PYTHON_BIN, args, {
     detached: false,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: getPythonEnv(),
+    env,
   });
   mountProc.stdout.pipe(log);
   mountProc.stderr.pipe(log);
@@ -245,15 +325,15 @@ function updateTray() {
 }
 
 // ── IPC handlers ──────────────────────────────────────────────────────────
-ipcMain.handle('get-settings',  ()     => store.store);
+ipcMain.handle('get-settings',  ()     => getStoredSettings());
 ipcMain.handle('get-status',    ()     => status);
 
 ipcMain.handle('save-settings', (_, d) => {
   const action = d._action;
   delete d._action;
-  const toSave = Object.fromEntries(
+  const toSave = prepareSettingsForSave(Object.fromEntries(
     Object.entries(d).filter(([, v]) => v !== undefined)
-  );
+  ));
   store.set(toSave);
   if (action === 'stop') {
     stopMount();
@@ -270,11 +350,8 @@ ipcMain.handle('browse-folder', async () => {
   const r = await dialog.showOpenDialog({ properties: ['openDirectory'] });
   return r.canceled ? null : r.filePaths[0];
 });
-ipcMain.handle('open-external', (_, url) => {
-  if (url === 'logs') return shell.openPath(LOG_FILE);
-  return shell.openExternal(url);
-});
-ipcMain.handle('open-folder',   (_, p) => shell.openPath(p));
+ipcMain.handle('open-external', (_, url) => openAllowedExternal(url));
+ipcMain.handle('open-folder',   (_, p) => openAllowedFolder(p));
 
 // ── App lifecycle ─────────────────────────────────────────────────────────
 app.whenReady().then(() => {
